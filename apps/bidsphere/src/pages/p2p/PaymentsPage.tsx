@@ -1,0 +1,704 @@
+import { useEffect, useMemo, useState } from "react";
+import { Link, useNavigate } from "react-router-dom";
+import { useQuery } from "@tanstack/react-query";
+import {
+  Bar,
+  BarChart,
+  CartesianGrid,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
+import {
+  CreditCard,
+  Plus,
+  TrendingUp,
+  Users,
+  Wallet,
+} from "lucide-react";
+import type { LucideIcon } from "lucide-react";
+
+import { getModesOfPayment, getPaymentEntries } from "../../api/accounts";
+import { getAllPayments, getVoucherById } from "../../api/vouchers";
+import { useVoucherSyncStore } from "../../store/voucherSyncStore";
+import type { Filter } from "../../api/erpnext";
+import PaymentActionsMenu from "../../components/payments/PaymentActionsMenu";
+import PdfActions from "../../components/PdfActions";
+import { buildPaymentReceiptPdf } from "../../utils/pdf/paymentPdf";
+import { buildVoucherPaymentPdf } from "../../utils/pdf/voucherDocPdf";
+import EmptyState from "../../components/EmptyState";
+import ConnectionError from "../../components/ConnectionError";
+import PageHeader from "../../components/PageHeader";
+import { TableSkeleton } from "../../components/Skeleton";
+import StatusBadge from "../../components/StatusBadge";
+import ExportButton from "../../components/export/ExportButton";
+import { FilterBar, FilterField, SearchInput, SortableTableHeader, ErpNextDatePicker } from "../../components/ui";
+import Pagination from "../../components/ui/Pagination";
+import { useListSort } from "../../hooks/useListSort";
+import { useDebounce } from "../../hooks/useDebounce";
+import { useClientPagination } from "../../hooks/usePagination";
+import type { ExportColumn } from "../../utils/export";
+import type { PaymentEntry } from "../../types/erpnext";
+import {
+  computePaymentKpis,
+  filterPayments,
+  formatCurrencyCompact,
+  mapPaymentUiStatus,
+  monthlyPaymentTrend,
+  PAYMENT_STATUS_OPTIONS,
+  paymentAmount,
+  recentLargePayments,
+  topSuppliersByPayment,
+  type PaymentUiStatus,
+} from "../../utils/paymentUtils";
+import { formatCurrency } from "../../utils/format";
+import { formatUsDisplayDate } from "../../utils/erpNextDate";
+import { getPaymentModeLabel } from "../../utils/usPaymentMethods";
+import {
+  PAYMENT_DEFAULT_SORT,
+  paymentComparators,
+  sortNewestFirst,
+} from "../../utils/listSort";
+import { useOptionalLayout } from "../../contexts/LayoutContext";
+
+const PAYMENT_COMPARATORS = paymentComparators<PaymentEntry>();
+const PAYMENT_CHART_HEIGHT = 340;
+
+/** Remount charts when sidebar or viewport width changes so Recharts recalculates layout. */
+function useChartLayoutKey(): number {
+  const layout = useOptionalLayout();
+  const [key, setKey] = useState(0);
+
+  useEffect(() => {
+    const bump = () => setKey((k) => k + 1);
+    window.addEventListener("resize", bump, { passive: true });
+    const timer = window.setTimeout(bump, 320);
+    return () => {
+      window.removeEventListener("resize", bump);
+      window.clearTimeout(timer);
+    };
+  }, [layout?.sidebarMode, layout?.sidebarOffset]);
+
+  return key;
+}
+
+export default function PaymentsPage() {
+  const navigate = useNavigate();
+  const [search, setSearch] = useState("");
+  const debouncedSearch = useDebounce(search, 300);
+  const [statusFilter, setStatusFilter] = useState<"" | PaymentUiStatus>("");
+  const [methodFilter, setMethodFilter] = useState("All");
+  const [dateFrom, setDateFrom] = useState("");
+  const [dateTo, setDateTo] = useState("");
+
+  const apiFilters = useMemo<Filter[]>(
+    () => [["payment_type", "=", "Pay"]],
+    []
+  );
+
+  const { data: paymentModes = [] } = useQuery({
+    queryKey: ["modes-of-payment"],
+    queryFn: getModesOfPayment,
+    staleTime: 5 * 60_000,
+  });
+
+  const { data: rows = [], isLoading, isError, error, refetch } = useQuery({
+    queryKey: ["payment-entries", apiFilters],
+    queryFn: () =>
+      getPaymentEntries({
+        filters: apiFilters,
+        fields: [
+          "name",
+          "party",
+          "party_name",
+          "posting_date",
+          "creation",
+          "mode_of_payment",
+          "paid_amount",
+          "received_amount",
+          "reference_no",
+          "status",
+          "docstatus",
+          "paid_from_account_currency",
+          "paid_to_account_currency",
+          "owner",
+        ],
+        order_by: "posting_date desc, creation desc, name desc",
+        limit_page_length: 200,
+      }),
+  });
+
+  // Workflow payments derived from the voucher store. These are appended to the
+  // ERPNext payment history (never replacing it) so the module is one unified
+  // ledger. Each carries its voucher id so the row can drill down to the
+  // linked Invoice → Voucher → PO → Supplier.
+  const syncVersion = useVoucherSyncStore((s) => s.version);
+  const { data: workflowPayments = [] } = useQuery({
+    queryKey: ["voucher-payments-all", syncVersion],
+    queryFn: () => getAllPayments(),
+    staleTime: 30_000,
+  });
+
+  const workflowRows = useMemo(
+    () =>
+      workflowPayments.map((p) => ({
+        name: p.payment_id,
+        party: p.supplier,
+        party_name: p.supplier_name,
+        posting_date: p.paid_date.slice(0, 10),
+        creation: p.paid_date,
+        mode_of_payment: p.method,
+        paid_amount: p.amount,
+        received_amount: p.amount,
+        reference_no: p.reference_number,
+        status: "Submitted",
+        docstatus: 1,
+        paid_from_account_currency: p.currency,
+        paid_to_account_currency: p.currency,
+        owner: "voucher-workflow",
+      })) as unknown as PaymentEntry[],
+    [workflowPayments]
+  );
+
+  // payment_id → voucher_id, so workflow rows drill into the invoice/voucher.
+  const workflowVoucherByName = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const p of workflowPayments) m.set(p.payment_id, p.voucher_id);
+    return m;
+  }, [workflowPayments]);
+
+  // Unified ledger: ERPNext history + workflow payments, deduplicated by name.
+  // ERPNext rows take priority (authoritative status/amounts). Workflow rows
+  // only appear when they don't yet exist in the ERPNext response (e.g. the
+  // Payment Entry was created locally but hasn't been fetched yet).
+  const mergedRows = useMemo(() => {
+    const seen = new Set<string>();
+    const result: PaymentEntry[] = [];
+    for (const r of rows) {
+      if (r.name && !seen.has(r.name)) {
+        seen.add(r.name);
+        result.push(r);
+      }
+    }
+    for (const r of workflowRows) {
+      if (r.name && !seen.has(r.name)) {
+        seen.add(r.name);
+        result.push(r);
+      }
+    }
+    return result;
+  }, [workflowRows, rows]);
+
+  function openPayment(p: PaymentEntry) {
+    const voucherId = p.name ? workflowVoucherByName.get(p.name) : undefined;
+    if (voucherId) {
+      navigate(`/p2p/invoices/${encodeURIComponent(voucherId)}`);
+    } else if (p.name) {
+      navigate(`/p2p/payments/${encodeURIComponent(p.name)}`);
+    }
+  }
+
+  const methodFilterOptions = useMemo(() => {
+    const workflowMethods = workflowPayments.map((p) => p.method);
+    return ["All", ...new Set([...paymentModes, ...workflowMethods])];
+  }, [paymentModes, workflowPayments]);
+
+  const filtered = useMemo(
+    () =>
+      filterPayments(mergedRows, {
+        search: debouncedSearch,
+        status: statusFilter,
+        method: methodFilter,
+        dateFrom,
+        dateTo,
+      }),
+    [mergedRows, debouncedSearch, statusFilter, methodFilter, dateFrom, dateTo]
+  );
+
+  const normalizedFiltered = useMemo(
+    () =>
+      sortNewestFirst(filtered, {
+        date: (p) => p.posting_date,
+        creation: (p) => p.creation,
+        name: (p) => p.name ?? "",
+      }),
+    [filtered]
+  );
+
+  const { sort, setSort, sortedRows } = useListSort(
+    normalizedFiltered,
+    PAYMENT_DEFAULT_SORT,
+    PAYMENT_COMPARATORS
+  );
+
+  const {
+    pageRows,
+    totalRecords,
+    totalPages,
+    currentPage,
+    pageSize,
+    setPage,
+    setPageSize,
+  } = useClientPagination(sortedRows, {
+    resetKey: `${debouncedSearch}|${statusFilter}|${methodFilter}|${dateFrom}|${dateTo}|${sort.key}|${sort.direction}`,
+  });
+
+  const kpis = useMemo(() => computePaymentKpis(mergedRows), [mergedRows]);
+  const trend = useMemo(() => monthlyPaymentTrend(mergedRows), [mergedRows]);
+  const topSuppliers = useMemo(
+    () => topSuppliersByPayment(mergedRows),
+    [mergedRows]
+  );
+  const largePayments = useMemo(() => recentLargePayments(filtered, 5), [filtered]);
+  const chartLayoutKey = useChartLayoutKey();
+
+  const exportColumns = useMemo<ExportColumn<PaymentEntry>[]>(
+    () => [
+      { id: "name", label: "Payment Number", accessor: (r) => r.name },
+      {
+        id: "supplier",
+        label: "Supplier",
+        accessor: (r) => r.party_name || r.party,
+      },
+      {
+        id: "posting_date",
+        label: "Date",
+        type: "date",
+        accessor: (r) => r.posting_date,
+      },
+      {
+        id: "method",
+        label: "Payment Method",
+        accessor: (r) => getPaymentModeLabel(r.mode_of_payment) || r.mode_of_payment,
+      },
+      {
+        id: "reference",
+        label: "Reference",
+        accessor: (r) => r.reference_no,
+      },
+      {
+        id: "status",
+        label: "Status",
+        type: "status",
+        accessor: (r) => mapPaymentUiStatus(r),
+      },
+      {
+        id: "amount",
+        label: "Amount",
+        type: "currency",
+        accessor: (r) => paymentAmount(r),
+      },
+    ],
+    [],
+  );
+
+  return (
+    <div className="payments-page">
+      <PageHeader
+        title="Payments"
+        description="Accounts Payable disbursements — ACH, wire, check, and card payments to suppliers."
+        actions={
+          <div className="flex flex-wrap items-center gap-2">
+            <ExportButton
+              module="Payments"
+              filenamePrefix="Payments"
+              columns={exportColumns}
+              rows={sortedRows}
+            />
+            <Link to="/p2p/payments/new" className="btn-primary">
+              <Plus className="h-4 w-4" /> New Payment
+            </Link>
+          </div>
+        }
+      />
+
+      <div className="payments-kpi-grid">
+        <PaymentKpiCard
+          icon={Wallet}
+          label="Total Payments"
+          value={formatCurrencyCompact(kpis.total)}
+          tone="primary"
+          loading={isLoading}
+        />
+        <PaymentKpiCard
+          icon={TrendingUp}
+          label="Payments This Month"
+          value={formatCurrencyCompact(kpis.monthTotal)}
+          tone="accent"
+          loading={isLoading}
+        />
+        <PaymentKpiCard
+          icon={CreditCard}
+          label="Pending Payments"
+          value={formatCurrencyCompact(kpis.pending)}
+          tone="warning"
+          loading={isLoading}
+        />
+        <PaymentKpiCard
+          icon={Users}
+          label="Active Suppliers Paid"
+          value={String(kpis.activeSuppliers)}
+          tone="neutral"
+          loading={isLoading}
+        />
+      </div>
+
+      <section className="payments-charts-section" aria-label="Payment analytics">
+        <div className="payments-charts-row">
+          <div className="payments-chart-card">
+            <div className="payments-chart-card__header">
+              <div>
+                <h3 className="payments-chart-card__title">
+                  Monthly Payment Trend
+                </h3>
+                <p className="payments-chart-card__subtitle">
+                  Payment spending month-wise
+                </p>
+              </div>
+            </div>
+            {isLoading ? (
+              <div
+                className="payments-chart-container payments-chart-container--skeleton"
+                aria-hidden
+              />
+            ) : (
+              <div className="payments-chart-container">
+                <ResponsiveContainer
+                  key={chartLayoutKey}
+                  width="100%"
+                  height={PAYMENT_CHART_HEIGHT}
+                >
+                  <BarChart
+                    data={trend}
+                    margin={{ top: 8, right: 12, left: 0, bottom: 4 }}
+                  >
+                    <CartesianGrid stroke="#e2e8f0" strokeDasharray="3 3" vertical={false} />
+                    <XAxis
+                      dataKey="label"
+                      tick={{ fill: "#64748b", fontSize: 11 }}
+                      axisLine={{ stroke: "#e2e8f0" }}
+                      tickLine={false}
+                    />
+                    <YAxis
+                      tick={{ fill: "#64748b", fontSize: 11 }}
+                      axisLine={false}
+                      tickLine={false}
+                      tickFormatter={(v: number) => formatCurrencyCompact(v)}
+                    />
+                    <Tooltip
+                      cursor={{ fill: "rgba(99,102,241,0.06)" }}
+                      contentStyle={{
+                        borderRadius: 8,
+                        border: "1px solid #e2e8f0",
+                        fontSize: 12,
+                      }}
+                      formatter={(value) =>
+                        formatCurrencyCompact(typeof value === "number" ? value : 0)
+                      }
+                    />
+                    <Bar dataKey="amount" name="Payments" fill="#3b82f6" radius={[4, 4, 0, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            )}
+          </div>
+
+          <aside className="payments-side-panels">
+            <div className="payments-side-panel">
+              <h3 className="payments-side-panel__title">
+                Top Suppliers by Payment
+              </h3>
+              <p className="payments-side-panel__subtitle">By total amount paid</p>
+              <ul className="payments-side-panel__list">
+                {topSuppliers.length === 0 ? (
+                  <li className="payments-side-panel__empty">No paid suppliers yet.</li>
+                ) : (
+                  topSuppliers.map((s, i) => (
+                    <li
+                      key={s.name}
+                      className="payments-side-panel__row"
+                    >
+                      <div className="flex min-w-0 items-center gap-2">
+                        <span className="payments-side-panel__rank">{i + 1}</span>
+                        <span className="payments-side-panel__name">{s.name}</span>
+                      </div>
+                      <span className="payments-side-panel__amount">
+                        {formatCurrencyCompact(s.total)}
+                      </span>
+                    </li>
+                  ))
+                )}
+              </ul>
+            </div>
+
+            <div className="payments-side-panel">
+              <h3 className="payments-side-panel__title">
+                Recent Large Payments
+              </h3>
+              <p className="payments-side-panel__subtitle">Highest value disbursements</p>
+              <ul className="payments-side-panel__list payments-side-panel__list--compact">
+                {largePayments.length === 0 ? (
+                  <li className="payments-side-panel__empty">No payments yet.</li>
+                ) : (
+                  largePayments.map((p) => (
+                    <li key={p.name}>
+                      <button
+                        type="button"
+                        onClick={() => openPayment(p)}
+                        className="payments-side-panel__action"
+                      >
+                        <div className="min-w-0">
+                          <p className="truncate text-xs font-medium text-neutral-800">
+                            {p.name}
+                          </p>
+                          <p className="truncate text-[10px] text-neutral-500">
+                            {p.party_name ?? p.party}
+                          </p>
+                        </div>
+                        <span className="shrink-0 text-xs font-semibold tabular-nums text-primary">
+                          {formatCurrencyCompact(paymentAmount(p))}
+                        </span>
+                      </button>
+                    </li>
+                  ))
+                )}
+              </ul>
+            </div>
+          </aside>
+        </div>
+      </section>
+
+      <FilterBar className="payments-filters">
+        <FilterField label="Search Payment Number" className="min-w-[200px] flex-1">
+          <SearchInput
+            value={search}
+            onChange={setSearch}
+            placeholder="Payment number, supplier, reference…"
+          />
+        </FilterField>
+        <FilterField label="Status" className="min-w-[140px]">
+          <select
+            value={statusFilter}
+            onChange={(e) =>
+              setStatusFilter(e.target.value as "" | PaymentUiStatus)
+            }
+            className="select-field"
+          >
+            <option value="">All</option>
+            {PAYMENT_STATUS_OPTIONS.filter(Boolean).map((s) => (
+              <option key={s} value={s}>
+                {s}
+              </option>
+            ))}
+          </select>
+        </FilterField>
+        <FilterField label="Payment Method" className="min-w-[150px]">
+          <select
+            value={methodFilter}
+            onChange={(e) => setMethodFilter(e.target.value)}
+            className="select-field"
+          >
+            {methodFilterOptions.map((m) => (
+              <option key={m} value={m}>
+                {m === "All" ? m : getPaymentModeLabel(m)}
+              </option>
+            ))}
+          </select>
+        </FilterField>
+        <FilterField label="From" className="min-w-[160px]">
+          <ErpNextDatePicker
+            value={dateFrom}
+            onChange={setDateFrom}
+            showFormatHint={false}
+          />
+        </FilterField>
+        <FilterField label="To" className="min-w-[160px]">
+          <ErpNextDatePicker
+            value={dateTo}
+            onChange={setDateTo}
+            showFormatHint={false}
+          />
+        </FilterField>
+      </FilterBar>
+
+      <div className="payments-table-shell table-shell">
+        {isLoading ? (
+          <TableSkeleton rows={8} columns={8} />
+        ) : isError && mergedRows.length === 0 ? (
+          <ConnectionError
+            error={error}
+            title="Could not load payments"
+            onRetry={() => void refetch()}
+          />
+        ) : sortedRows.length === 0 ? (
+          <EmptyState
+            icon={CreditCard}
+            title="No payments found"
+            description="Adjust filters or record a new payment against an invoice."
+            action={
+              <Link to="/p2p/payments/new" className="btn-primary">
+                <Plus className="h-4 w-4" /> New Payment
+              </Link>
+            }
+          />
+        ) : (
+          <>
+            <div className="overflow-x-auto">
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <SortableTableHeader label="Payment Number" sortKey="name" sort={sort} onSort={setSort} />
+                    <SortableTableHeader label="Supplier" sortKey="supplier" sort={sort} onSort={setSort} />
+                    <SortableTableHeader label="Date" sortKey="date" sort={sort} onSort={setSort} />
+                    <SortableTableHeader label="Payment Method" sortKey="method" sort={sort} onSort={setSort} />
+                    <th>Reference Number</th>
+                    <SortableTableHeader label="Status" sortKey="status" sort={sort} onSort={setSort} />
+                    <SortableTableHeader label="Amount" sortKey="amount" sort={sort} onSort={setSort} className="text-right" />
+                    <th>PDF</th>
+                    <th className="w-12" />
+                  </tr>
+                </thead>
+                <tbody>
+                  {pageRows.map((p) => {
+                    const isWorkflow = !!(
+                      p.name && workflowVoucherByName.has(p.name)
+                    );
+                    return (
+                      <tr
+                        key={p.name}
+                        className="cursor-pointer"
+                        onClick={() => openPayment(p)}
+                      >
+                        <td>
+                          <span className="table-link">{p.name}</span>
+                        </td>
+                        <td className="text-neutral-600">
+                          {p.party_name ?? p.party ?? "—"}
+                        </td>
+                        <td className="text-neutral-600">
+                          {formatUsDisplayDate(p.posting_date) || "—"}
+                        </td>
+                        <td className="text-neutral-600">
+                          {p.mode_of_payment
+                            ? getPaymentModeLabel(p.mode_of_payment)
+                            : "—"}
+                        </td>
+                        <td className="text-neutral-600">
+                          {p.reference_no ?? "—"}
+                        </td>
+                        <td>
+                          <StatusBadge status={mapPaymentUiStatus(p)} />
+                        </td>
+                        <td className="text-right tabular-nums">
+                          <span className="block font-medium">
+                            {formatCurrency(paymentAmount(p))}
+                          </span>
+                        </td>
+                        <td>
+                          <PdfActions
+                            variant="compact"
+                            stopPropagation
+                            filename={
+                              (p.name ?? "PAYMENT")
+                                .toUpperCase()
+                                .startsWith("PAY-")
+                                ? `${p.name}.pdf`
+                                : `PAY-${p.name ?? "PAYMENT"}.pdf`
+                            }
+                            build={async () => {
+                              const voucherId = p.name
+                                ? workflowVoucherByName.get(p.name)
+                                : undefined;
+                              if (voucherId) {
+                                const v = await getVoucherById(voucherId);
+                                if (!v) throw new Error("Voucher not found");
+                                return buildVoucherPaymentPdf(v);
+                              }
+                              return buildPaymentReceiptPdf(p);
+                            }}
+                          />
+                        </td>
+                        <td>
+                          {isWorkflow ? (
+                            <span className="text-[10px] text-neutral-400">
+                              —
+                            </span>
+                          ) : (
+                            <PaymentActionsMenu payment={p} />
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+            <Pagination
+              currentPage={currentPage}
+              totalPages={totalPages}
+              totalRecords={totalRecords}
+              pageSize={pageSize}
+              onPageChange={setPage}
+              onPageSizeChange={setPageSize}
+              recordLabel="payments"
+            />
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function PaymentKpiCard({
+  icon: Icon,
+  label,
+  value,
+  tone,
+  loading,
+}: {
+  icon: LucideIcon;
+  label: string;
+  value: string;
+  tone: "primary" | "accent" | "warning" | "neutral";
+  loading?: boolean;
+}) {
+  const gradients: Record<string, string> = {
+    primary: "bg-primary-50 ring-primary-100",
+    accent: "bg-primary-50 ring-primary-100",
+    warning: "bg-warning-50 ring-warning-100",
+    neutral: "bg-neutral-50 ring-neutral-200",
+  };
+  const iconTone: Record<string, string> = {
+    primary: "bg-primary text-white shadow-primary/25",
+    accent: "bg-primary-500 text-white shadow-primary/25",
+    warning: "bg-warning-500 text-white shadow-warning/25",
+    neutral: "bg-neutral-600 text-white",
+  };
+
+  return (
+    <div
+      className={`relative overflow-hidden rounded-xl p-5 shadow-sm ring-1 ${gradients[tone]}`}
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <p className="text-[11px] font-semibold uppercase tracking-wide text-neutral-500">
+            {label}
+          </p>
+          {loading ? (
+            <div className="mt-2 h-8 w-24 animate-pulse rounded bg-neutral-200/60" />
+          ) : (
+            <p className="mt-1 text-2xl font-bold tracking-tight text-neutral-900">
+              {value}
+            </p>
+          )}
+        </div>
+        <div
+          className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl shadow-md ${iconTone[tone]}`}
+        >
+          <Icon className="h-5 w-5" />
+        </div>
+      </div>
+    </div>
+  );
+}

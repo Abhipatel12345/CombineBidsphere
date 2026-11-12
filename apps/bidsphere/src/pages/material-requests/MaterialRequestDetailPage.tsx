@@ -1,0 +1,1369 @@
+import { useEffect, useMemo, useState } from "react";
+import { Link, useNavigate, useParams } from "react-router-dom";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useTranslation } from "react-i18next";
+import toast from "react-hot-toast";
+import {
+  ArrowLeft,
+  Check,
+  CheckCircle2,
+  Loader2,
+  Package,
+  Pencil,
+  Send,
+  Trash2,
+  Truck,
+  Warehouse,
+  XCircle,
+} from "lucide-react";
+
+import {
+  parseStructuredWarehouseProcessing,
+  sanitizeHumanRemarks,
+} from "../../utils/materialIssueRemarksDisplay";
+import MaterialIssueAuditPanel from "../../components/warehouse/MaterialIssueAuditPanel";
+import { ACCEPTANCE_CHECKLIST_LABELS } from "../../types/materialIssueReceipt";
+
+import {
+  checkMaterialRequestStock,
+  completeMaterialRequest,
+  deleteMaterialRequestWorkflow,
+  fetchMaterialRequestWorkflow,
+  getMaterialRequestMode,
+  getMaterialRequestProcurementProgress,
+  getMaterialRequestProcurementType,
+  getMaterialRequestWorkflowStatus,
+  getLinkedRfqName,
+  getUserFullName,
+  isMaterialRequestOwnedByUser,
+  issueMaterialRequest,
+  markMaterialRequestStockAvailable,
+  rejectMaterialRequest,
+  submitMaterialRequestWorkflow,
+  type MaterialRequestProcurementProgress,
+  type MaterialRequestWorkflowRecord,
+} from "../../api/materialRequestWorkflow";
+import type { MaterialRequestWorkflowStatus } from "../../types/materialRequestWorkflow";
+import { listTimersForReference } from "../../api/sla";
+import { syncMaterialRequestSla } from "../../api/slaIntegration";
+import { isSlaVisibleForRole } from "../../config/slaAccess";
+import SlaBadge from "../../components/sla/SlaBadge";
+import PageHeader from "../../components/PageHeader";
+import ProcurementTypeBadge from "../../components/ProcurementTypeBadge";
+import RequestModeBadge from "../../components/RequestModeBadge";
+import ConfirmDialog from "../../components/ui/ConfirmDialog";
+import { Skeleton } from "../../components/Skeleton";
+import {
+  Drawing2dCell,
+  PartNameCell,
+} from "../../components/warehouse/EngineeringDocCells";
+import MrRfqActionControl from "../../components/material-requests/MrRfqActionControl";
+import { useAuthStore } from "../../store/authStore";
+import {
+  canCreateMaterialRequest,
+  canCreateRfqFromMR,
+  canDeleteMaterialRequest,
+  canReviewMaterialRequest,
+} from "../../config/materialRequestPermissions";
+import { ROLE_LABELS } from "../../config/roles";
+import { formatDate } from "../../utils/format";
+import {
+  computeRequestFulfillment,
+  type RequestFulfillment,
+} from "../../utils/materialRequestFulfillment";
+import {
+  FulfillmentBar,
+  ItemStatusBadge,
+  QtyChip,
+} from "../../components/material-requests/FulfillmentUI";
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * Status badge — the exact color scheme requested for the Department portal:
+ *   Completed → Green · Issued → Blue · Pending → Orange
+ *   Forwarded → Purple · Rejected → Red
+ * ────────────────────────────────────────────────────────────────────────── */
+const MR_BADGE: Record<
+  MaterialRequestWorkflowStatus,
+  { label: string; cls: string }
+> = {
+  Draft: { label: "Draft", cls: "bg-neutral-100 text-neutral-600" },
+  Submitted: { label: "Submitted", cls: "bg-orange-100 text-orange-700" },
+  "Admin Review": {
+    label: "Under Warehouse Review",
+    cls: "bg-orange-100 text-orange-700",
+  },
+  "Under Warehouse Review": {
+    label: "Under Warehouse Review",
+    cls: "bg-orange-100 text-orange-700",
+  },
+  "Stock Available": {
+    label: "Stock Available",
+    cls: "bg-orange-100 text-orange-700",
+  },
+  "Material Issued": {
+    label: "Material Issued",
+    cls: "bg-blue-100 text-blue-700",
+  },
+  "Pending Department Acceptance": {
+    label: "Waiting for Acceptance",
+    cls: "bg-amber-100 text-amber-800",
+  },
+  "Partially Issued": {
+    label: "Partially Issued",
+    cls: "bg-orange-100 text-orange-800",
+  },
+  "Procurement Required": {
+    label: "Procurement Required",
+    cls: "bg-orange-100 text-orange-700",
+  },
+  "Forwarded to Procurement": {
+    label: "Sent to Procurement",
+    cls: "bg-purple-100 text-purple-700",
+  },
+  "RFQ Created": { label: "RFQ Created", cls: "bg-purple-100 text-purple-700" },
+  Completed: { label: "Completed", cls: "bg-emerald-100 text-emerald-700" },
+  Cancelled: { label: "Cancelled", cls: "bg-red-100 text-red-700" },
+};
+
+/** Milestones that exist as live documents but not as MR workflow statuses. */
+const STAGE_BADGE_EXTRA: Record<string, { label: string; cls: string }> = {
+  "Purchase Ordered": {
+    label: "Purchase Ordered",
+    cls: "bg-indigo-100 text-indigo-700",
+  },
+  "Goods Received": {
+    label: "Goods Received",
+    cls: "bg-teal-100 text-teal-700",
+  },
+};
+
+/**
+ * Resolve the badge that best reflects the request's TRUE stage. For a
+ * procurement request the stored status stalls at "RFQ Created", so the live
+ * PO / GRN / Stock Entry milestones take precedence — the badge tracks the
+ * same signal as the timeline.
+ */
+function resolveStageBadge(
+  effectiveStatus: MaterialRequestWorkflowStatus,
+  procurementInvolved: boolean,
+  progress: MaterialRequestProcurementProgress | null | undefined,
+  fullyIssued: boolean,
+): { label: string; cls: string } {
+  const fallback = MR_BADGE[effectiveStatus] ?? MR_BADGE.Draft;
+  // Dual-sign acceptance gate — never show Completed while waiting.
+  if (effectiveStatus === "Pending Department Acceptance") {
+    return MR_BADGE["Pending Department Acceptance"];
+  }
+  if (!procurementInvolved || !progress) return fallback;
+  if (fullyIssued && effectiveStatus === "Completed") return MR_BADGE.Completed;
+  if (fullyIssued) return MR_BADGE["Pending Department Acceptance"];
+  if (progress.stockEntries.length > 0) return MR_BADGE["Material Issued"];
+  if (progress.goodsReceipts.length > 0) return STAGE_BADGE_EXTRA["Goods Received"];
+  if (progress.purchaseOrders.length > 0)
+    return STAGE_BADGE_EXTRA["Purchase Ordered"];
+  return fallback;
+}
+
+function StageBadge({ label, cls }: { label: string; cls: string }) {
+  return (
+    <span
+      className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-semibold ${cls}`}
+    >
+      {label}
+    </span>
+  );
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * Dynamic workflow — the visible steps depend on the actual path a Material
+ * Request took. When stock covered the request the procurement stages are
+ * hidden entirely; only when Procurement was actually involved do they appear.
+ * ────────────────────────────────────────────────────────────────────────── */
+const STOCK_PATH_STEPS = [
+  "Material Request Created",
+  "Warehouse Review",
+  "Material Issued",
+  "Warehouse Signed",
+  "Waiting Department Acceptance",
+  "Department Signed",
+  "Completed",
+];
+
+const PROCUREMENT_PATH_STEPS = [
+  "Request Submitted",
+  "Warehouse Review",
+  "Sent to Procurement",
+  "RFQ Created",
+  "Purchase Ordered",
+  "Goods Received",
+  "Material Issued",
+  "Completed",
+];
+
+/** Whether Procurement has actually handled this request (drives the timeline). */
+function isProcurementInvolved(
+  mr: MaterialRequestWorkflowRecord,
+  fulfillment: RequestFulfillment,
+): boolean {
+  return (
+    Boolean(mr.custom_linked_rfq) ||
+    Boolean(mr.custom_procurement_remarks?.trim()) ||
+    fulfillment.totals.procurement > 0 ||
+    fulfillment.workflowStatus === "Procurement Required" ||
+    fulfillment.workflowStatus === "Forwarded to Procurement" ||
+    fulfillment.workflowStatus === "RFQ Created"
+  );
+}
+
+function resolveTimeline(
+  status: MaterialRequestWorkflowStatus,
+  procurementInvolved: boolean,
+  progress?: MaterialRequestProcurementProgress | null,
+  fullyIssued?: boolean,
+): { steps: string[]; currentIndex: number } {
+  if (procurementInvolved) {
+    // Base index from the stored workflow status…
+    let index = (() => {
+      switch (status) {
+        case "Submitted":
+          return 0;
+        case "Admin Review":
+        case "Under Warehouse Review":
+        case "Stock Available":
+          return 1;
+        // Legacy pre-forward shortage status — still warehouse-owned.
+        case "Procurement Required":
+          return 1;
+        case "Forwarded to Procurement":
+          return 2;
+        case "RFQ Created":
+          return 3;
+        case "Material Issued":
+        case "Pending Department Acceptance":
+          return 6;
+        case "Completed":
+          return 7;
+        default:
+          return 0;
+      }
+    })();
+
+    // …then advance it from LIVE linked documents. `custom_bidsphere_status`
+    // stops at "RFQ Created", so the PO / GRN / Stock Entry milestones (steps
+    // 4–6) are driven entirely by whether the submitted document exists. Using
+    // Math.max also prevents a status regression (e.g. an MR moved back to
+    // "Stock Available" after goods arrived) from rewinding the bar.
+    if (progress) {
+      if (progress.purchaseOrders.length > 0) index = Math.max(index, 4);
+      if (progress.goodsReceipts.length > 0) index = Math.max(index, 5);
+      if (progress.stockEntries.length > 0) index = Math.max(index, 6);
+    }
+    if (fullyIssued && status === "Completed") index = 7;
+
+    return { steps: PROCUREMENT_PATH_STEPS, currentIndex: index };
+  }
+
+  const index = (() => {
+    switch (status) {
+      case "Submitted":
+        return 0;
+      case "Admin Review":
+      case "Under Warehouse Review":
+      case "Stock Available":
+        return 1;
+      case "Material Issued":
+        // Issued but warehouse signature may still be pending on the receipt.
+        return 2;
+      case "Pending Department Acceptance":
+        // Warehouse signed → waiting department (skip "Warehouse Signed" as done).
+        return 4;
+      case "Completed":
+        return 6;
+      default:
+        return 0;
+    }
+  })();
+  return { steps: STOCK_PATH_STEPS, currentIndex: index };
+}
+
+function WorkflowTimeline({
+  status,
+  procurementInvolved,
+  progress,
+  fullyIssued,
+}: {
+  status: MaterialRequestWorkflowStatus;
+  procurementInvolved: boolean;
+  progress?: MaterialRequestProcurementProgress | null;
+  fullyIssued?: boolean;
+}) {
+  if (status === "Draft") {
+    return (
+      <TimelineShell>
+        <div className="rounded-xl border border-neutral-200 bg-neutral-50 px-4 py-3 text-sm text-neutral-600">
+          Draft — Submit to start the approval workflow.
+        </div>
+      </TimelineShell>
+    );
+  }
+
+  if (status === "Cancelled") {
+    return (
+      <TimelineShell>
+        <div className="flex items-start gap-3 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+          <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
+          <div>
+            <p className="font-semibold">This Material Request was cancelled.</p>
+            <p className="mt-1 text-red-600">
+              Review the remarks below for more information.
+            </p>
+          </div>
+        </div>
+      </TimelineShell>
+    );
+  }
+
+  const { steps, currentIndex } = resolveTimeline(
+    status,
+    procurementInvolved,
+    progress,
+    fullyIssued,
+  );
+  const stepCount = steps.length;
+  const lastIndex = stepCount - 1;
+  const inset = 100 / (2 * stepCount);
+  const activeTrackWidth = `${Math.max(0, currentIndex) * (100 / stepCount)}%`;
+
+  return (
+    <TimelineShell>
+      <div className="relative overflow-x-auto">
+        <div
+          className="absolute top-4 h-0.5 bg-neutral-200"
+          style={{ left: `${inset}%`, right: `${inset}%` }}
+        />
+        <div
+          className="absolute top-4 h-0.5 bg-emerald-400 transition-all duration-500"
+          style={{ left: `${inset}%`, width: activeTrackWidth }}
+        />
+
+        <div
+          className="grid gap-2"
+          style={{
+            minWidth: `${stepCount * 88}px`,
+            gridTemplateColumns: `repeat(${stepCount}, minmax(0, 1fr))`,
+          }}
+        >
+          {steps.map((step, index) => {
+            const isCurrent = currentIndex < lastIndex && index === currentIndex;
+            const isCompleted =
+              currentIndex >= lastIndex
+                ? index <= currentIndex
+                : index < currentIndex;
+            const isPending = index > currentIndex;
+
+            return (
+              <div key={step} className="flex flex-col items-center text-center">
+                <div
+                  className={[
+                    "relative z-10 flex h-8 w-8 items-center justify-center rounded-full border-2 bg-white",
+                    isCompleted
+                      ? "border-emerald-500 bg-emerald-500 text-white"
+                      : isCurrent
+                        ? "border-primary-500 bg-white text-primary-600"
+                        : "border-neutral-300 bg-white text-neutral-400",
+                  ].join(" ")}
+                >
+                  {isCompleted ? (
+                    <Check className="h-4 w-4" />
+                  ) : isCurrent ? (
+                    <span className="h-2.5 w-2.5 rounded-full bg-primary-500" />
+                  ) : (
+                    <span className="text-xs font-semibold">{index + 1}</span>
+                  )}
+                </div>
+                <p
+                  className={[
+                    "mt-2 text-[11px] leading-tight",
+                    isCompleted
+                      ? "font-medium text-emerald-700"
+                      : isCurrent
+                        ? "font-semibold text-primary-700"
+                        : isPending
+                          ? "font-medium text-neutral-400"
+                          : "font-medium text-neutral-500",
+                  ].join(" ")}
+                >
+                  {step}
+                </p>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </TimelineShell>
+  );
+}
+
+function TimelineShell({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="card mb-6 p-5">
+      <div className="mb-4 flex items-center gap-2">
+        <CheckCircle2 className="h-4 w-4 text-primary-600" />
+        <h3 className="text-sm font-bold text-neutral-900">Procurement Status</h3>
+      </div>
+      {children}
+    </div>
+  );
+}
+
+/**
+ * Strip the machine-only `[BidSphere:ForwardedItems:[…]]` snapshot that the
+ * warehouse workflow embeds inside the remarks field so users never see raw
+ * JSON. Returns the human-readable remainder (may be empty).
+ */
+function cleanRemarks(raw?: string): string {
+  return sanitizeHumanRemarks(raw);
+}
+
+export default function MaterialRequestDetailPage() {
+  const { name = "" } = useParams();
+  const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  const user = useAuthStore((s) => s.user);
+  const role = user?.role;
+  // SLA is temporarily Admin-only — non-admin users skip SLA sync/fetch and the
+  // SLA badge entirely.
+  const slaVisible = isSlaVisibleForRole(role);
+  const { t } = useTranslation();
+  // Department users must never see warehouse inventory. The "Available" column
+  // and its live stock fetch are gated to warehouse / procurement / admin.
+  const showStock = role !== "department";
+
+  const [warehouseRemarks, setWarehouseRemarks] = useState("");
+  const [showDeleteModal, setShowDeleteModal] = useState(false);
+  // Set the instant a delete succeeds. Disables the detail query so React Query
+  // can NEVER refetch the now-deleted record (which would 404 with "Reference
+  // Name … does not exist") while the page unmounts and the redirect happens.
+  const [deleted, setDeleted] = useState(false);
+  // ERPNext's status field has no "Stock Available" option, so a successful
+  // stock check is persisted as "Under Warehouse Review". This session flag
+  // keeps the "Issue Material" action unlocked right after the check without
+  // relying on a status value ERPNext can't store.
+  const [stockConfirmedLocal, setStockConfirmedLocal] = useState(false);
+
+  const {
+    data: mr,
+    isLoading,
+    isError,
+  } = useQuery<MaterialRequestWorkflowRecord>({
+    queryKey: ["material-request-workflow", name],
+    queryFn: () => fetchMaterialRequestWorkflow(name, { fresh: true }),
+    // Once deleted, keep the query permanently disabled so neither cache
+    // removal nor window-focus can trigger a refetch of the missing record.
+    enabled: !!name && !deleted,
+    refetchOnWindowFocus: !deleted,
+  });
+
+  // Keep the SLA timer for this MR's current stage in sync, then surface it.
+  useEffect(() => {
+    if (mr && slaVisible) void syncMaterialRequestSla(mr);
+  }, [mr, slaVisible]);
+
+  const slaTimersQuery = useQuery({
+    queryKey: ["sla-timers-ref", "Material Request", name],
+    queryFn: () => listTimersForReference("Material Request", name),
+    enabled: slaVisible && !!name && !deleted,
+    staleTime: 30_000,
+    refetchInterval: 60_000,
+    retry: false,
+  });
+  const activeSlaTimer = useMemo(() => {
+    const timers = slaTimersQuery.data ?? [];
+    return (
+      timers.find(
+        (t) => t.sla_status === "Running" || t.sla_status === "Due Soon"
+      ) ??
+      timers.find((t) => t.sla_status === "Breached") ??
+      null
+    );
+  }, [slaTimersQuery.data]);
+
+  // Live stock levels from ERPNext Bin for the Available column. Read-only —
+  // `checkMaterialRequestStock` only queries Bin, it never mutates the MR.
+  const stockQuery = useQuery({
+    queryKey: ["material-request-live-stock", name],
+    queryFn: () => checkMaterialRequestStock(name),
+    enabled: !!name && !deleted && showStock,
+    staleTime: 30_000,
+    refetchOnWindowFocus: !deleted,
+  });
+
+  // Live procurement milestones (submitted PO → GRN → Stock Entry) read
+  // straight from the linked ERPNext documents. This is what advances the
+  // Track Request timeline past "RFQ Created" — the stored MR status never
+  // does. Enabled once the request is on the procurement path.
+  const procurementPath =
+    !!mr &&
+    (Boolean(mr.custom_linked_rfq) ||
+      Boolean(mr.custom_procurement_remarks?.trim()) ||
+      getMaterialRequestWorkflowStatus(mr) === "Procurement Required" ||
+      getMaterialRequestWorkflowStatus(mr) === "Forwarded to Procurement" ||
+      getMaterialRequestWorkflowStatus(mr) === "RFQ Created");
+
+  const progressQuery = useQuery({
+    queryKey: ["material-request-progress", name],
+    queryFn: () =>
+      getMaterialRequestProcurementProgress(name, mr?.custom_linked_rfq),
+    enabled: !!name && !deleted && procurementPath,
+    staleTime: 30_000,
+    refetchOnWindowFocus: !deleted,
+  });
+
+  const availableByItem = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const line of stockQuery.data?.lines ?? []) {
+      map.set(line.item_code, line.available_qty);
+    }
+    return map;
+  }, [stockQuery.data]);
+
+  // Resolve the requester's real name (never an email). Falls back to the
+  // logged-in user's own full name when they are the requester.
+  const requesterIdentifier =
+    mr?.custom_requested_by || mr?.requested_by || mr?.owner || "";
+  const { data: resolvedRequesterName } = useQuery({
+    queryKey: ["mr-requester-name", requesterIdentifier],
+    queryFn: () => getUserFullName(requesterIdentifier),
+    enabled: !!requesterIdentifier && requesterIdentifier.includes("@"),
+    staleTime: 5 * 60_000,
+  });
+
+  const invalidate = () => {
+    queryClient.invalidateQueries({
+      queryKey: ["material-request-workflow", name],
+    });
+    queryClient.invalidateQueries({
+      queryKey: ["material-request-progress", name],
+    });
+    queryClient.invalidateQueries({
+      queryKey: ["material-request-live-stock", name],
+    });
+    queryClient.invalidateQueries({ queryKey: ["material-requests-workflow"] });
+    queryClient.invalidateQueries({ queryKey: ["mr-dashboard-counts"] });
+    queryClient.invalidateQueries({ queryKey: ["mr-dashboard-recent"] });
+    queryClient.invalidateQueries({ queryKey: ["mr-dashboard-rows"] });
+    queryClient.invalidateQueries({ queryKey: ["mr-procurement-queue"] });
+    queryClient.invalidateQueries({ queryKey: ["warehouse"] });
+  };
+
+  const submitMutation = useMutation({
+    mutationFn: () =>
+      submitMaterialRequestWorkflow(name, {
+        email: user?.email,
+        name: user?.name,
+        full_name: user?.full_name,
+      }),
+    onSuccess: (verified) => {
+      // This is the post-transition ERP GET, never an optimistic status patch.
+      queryClient.setQueryData(["material-request-workflow", name], verified);
+      toast.success(`Material Request ${name} submitted to Warehouse.`);
+      invalidate();
+      void queryClient.invalidateQueries({
+        queryKey: ["warehouse", "pending-requests"],
+      });
+      void queryClient.refetchQueries({ queryKey: ["warehouse"] });
+    },
+    onError: (e) =>
+      toast.error(e instanceof Error ? e.message : "Submit failed"),
+  });
+
+  // Live stock check against ERPNext Bin. When all lines are sufficient the MR
+  // is moved to "Stock Available" (persisted in ERPNext), which unlocks Issue
+  // Material for every reviewer/device.
+  const checkStockMutation = useMutation({
+    mutationFn: async () => {
+      const result = await checkMaterialRequestStock(name);
+      if (result.all_sufficient) {
+        await markMaterialRequestStockAvailable(
+          name,
+          warehouseRemarks || undefined,
+        );
+      }
+      return result;
+    },
+    onSuccess: (result) => {
+      if (result.all_sufficient) {
+        setStockConfirmedLocal(true);
+        toast.success("Stock available — you can now issue material");
+      } else {
+        toast("Insufficient stock — send this request to Procurement", {
+          icon: "⚠️",
+        });
+      }
+      invalidate();
+    },
+    onError: (e) =>
+      toast.error(e instanceof Error ? e.message : "Stock check failed"),
+  });
+
+  const issueMutation = useMutation({
+    mutationFn: () =>
+      issueMaterialRequest(name, { warehouse_remarks: warehouseRemarks }),
+    onSuccess: (res) => {
+      toast.success(`Material issued — Stock Entry ${res.stock_entry}`);
+      invalidate();
+    },
+    onError: (e) =>
+      toast.error(e instanceof Error ? e.message : "Issue failed"),
+  });
+
+  const completeMutation = useMutation({
+    mutationFn: () => completeMaterialRequest(name, warehouseRemarks || undefined),
+    onSuccess: () => {
+      toast.success("Material Request marked as Completed");
+      invalidate();
+    },
+    onError: (e) =>
+      toast.error(e instanceof Error ? e.message : "Complete failed"),
+  });
+
+  const rejectMutation = useMutation({
+    mutationFn: () => rejectMaterialRequest(name, warehouseRemarks),
+    onSuccess: () => {
+      toast.success("Material Request cancelled");
+      invalidate();
+    },
+    onError: (e) =>
+      toast.error(e instanceof Error ? e.message : "Cancel failed"),
+  });
+
+  const backPath =
+    role === "department" ? "/material-requests/list" : "/material-requests";
+
+  const deleteMutation = useMutation({
+    mutationFn: () =>
+      deleteMaterialRequestWorkflow(name, {
+        email: user?.email,
+        name: user?.name,
+        role: role ? ROLE_LABELS[role] : undefined,
+      }),
+    onSuccess: () => {
+      // 1. Disable the detail query FIRST so nothing can refetch the deleted
+      //    record (cache removal / window-focus / invalidation).
+      setDeleted(true);
+      setShowDeleteModal(false);
+
+      // 2. Abort any in-flight fetch for this record, then drop it from cache.
+      void queryClient.cancelQueries({
+        queryKey: ["material-request-workflow", name],
+      });
+      queryClient.removeQueries({
+        queryKey: ["material-request-workflow", name],
+      });
+
+      // 3. Refresh the lists/dashboards (these never touch the deleted doc).
+      queryClient.invalidateQueries({
+        queryKey: ["material-requests-workflow"],
+      });
+      queryClient.invalidateQueries({ queryKey: ["mr-dashboard-counts"] });
+      queryClient.invalidateQueries({ queryKey: ["mr-dashboard-recent"] });
+      queryClient.invalidateQueries({ queryKey: ["mr-dashboard-rows"] });
+
+      // 4. One success toast, then redirect to the list (no back-nav to a 404).
+      toast.success("Material Request deleted successfully.");
+      navigate(backPath, { replace: true });
+    },
+    onError: (e) => {
+      // Delete failed — stay on the page and surface the actual backend error.
+      setShowDeleteModal(false);
+      toast.error(e instanceof Error ? e.message : "Delete failed");
+    },
+  });
+
+  // Just deleted — the redirect is in flight; render nothing so the removed
+  // record never flashes a "not found" state on the way out.
+  if (deleted) {
+    return null;
+  }
+
+  if (isLoading) {
+    return (
+      <div className="space-y-4">
+        <Skeleton className="h-6 w-48" />
+        <Skeleton className="h-32 w-full" />
+      </div>
+    );
+  }
+
+  if (isError || !mr) {
+    return (
+      <div className="py-16 text-center text-neutral-500">
+        Material Request not found.
+        <Link to={backPath} className="mt-2 block text-primary-600">
+          Back to Request History
+        </Link>
+      </div>
+    );
+  }
+
+  const workflowStatus = getMaterialRequestWorkflowStatus(mr);
+  const fulfillment = computeRequestFulfillment(mr);
+  const procurementInvolved = isProcurementInvolved(mr, fulfillment);
+  const progress = progressQuery.data ?? null;
+
+  // Fully issued from stock does NOT complete the MR until the department
+  // digitally accepts the Material Issue Receipt. While waiting, keep
+  // Pending Department Acceptance (never jump to Completed).
+  const requestedTotal = fulfillment.totals.requested;
+  const liveIssuedQty = progress?.issuedQty ?? 0;
+  const isFullyIssued =
+    requestedTotal > 0 &&
+    ((fulfillment.totals.remaining === 0 &&
+      fulfillment.totals.issued === requestedTotal) ||
+      liveIssuedQty >= requestedTotal);
+  const awaitingAcceptance =
+    workflowStatus === "Pending Department Acceptance";
+  const effectiveStatus: MaterialRequestWorkflowStatus = awaitingAcceptance
+    ? "Pending Department Acceptance"
+    : workflowStatus === "Completed"
+      ? "Completed"
+      : isFullyIssued && workflowStatus === "Material Issued"
+        ? "Pending Department Acceptance"
+        : workflowStatus;
+
+  // Badge that reflects the true live stage (PO / GRN / Issue), not the stalled
+  // stored status.
+  const stageBadge = resolveStageBadge(
+    effectiveStatus,
+    procurementInvolved,
+    progress,
+    isFullyIssued,
+  );
+
+  // Requested By — a real name, never an email. Prefer a stored human name,
+  // then the ERPNext User lookup, then the logged-in user's own name, and
+  // finally a friendly role fallback.
+  const rawRequester = (mr.custom_requested_by || mr.requested_by || "").trim();
+  const requesterName =
+    (rawRequester && !rawRequester.includes("@") ? rawRequester : "") ||
+    resolvedRequesterName ||
+    (mr.owner && user?.email && mr.owner === user.email ? user.full_name : "") ||
+    "Department User";
+
+  // The warehouse the material was (or would be) issued from — live ERPNext
+  // value, used to auto-populate the warehouse remark after an issue.
+  const warehouseName =
+    stockQuery.data?.lines.find((l) => l.warehouse && l.warehouse !== "—")
+      ?.warehouse ||
+    fulfillment.items.find((i) => i.warehouse && i.warehouse !== "—")?.warehouse ||
+    "";
+
+  const isDraftDoc = (mr.docstatus ?? 0) === 0;
+  const isDraftWorkflow = workflowStatus === "Draft";
+  // MRs are created through the shared integration token, so `owner` is the API
+  // user — the real requester is tracked in custom_requested_by/requested_by.
+  // Match against all three so Submit/Edit/Delete render for the requester.
+  const isOwner = isMaterialRequestOwnedByUser(mr, {
+    email: user?.email,
+    name: user?.name,
+    fullName: user?.full_name,
+  });
+  // Submit when BidSphere Status is Draft — ERP docstatus may already be 1 for
+  // recovered docs; submitMaterialRequestWorkflow handles both cases.
+  const canSubmit =
+    isDraftWorkflow && canCreateMaterialRequest(role);
+  const isSubmitted = (mr.docstatus ?? 0) === 1 && !isDraftWorkflow;
+  const procurementType = getMaterialRequestProcurementType(mr);
+  const requestMode = getMaterialRequestMode(mr);
+  const canWarehouseAct =
+    canReviewMaterialRequest(role) &&
+    (workflowStatus === "Under Warehouse Review" ||
+      workflowStatus === "Admin Review" ||
+      workflowStatus === "Stock Available") &&
+    isSubmitted;
+  // Issue Material is only unlocked once stock has been confirmed available.
+  const stockConfirmed =
+    workflowStatus === "Stock Available" || stockConfirmedLocal;
+  // Never offer Issue when the latest stock check shows Available Qty <= 0.
+  const stockCheckBlocksIssue = Boolean(
+    checkStockMutation.data &&
+      (!(checkStockMutation.data.all_sufficient) ||
+        (checkStockMutation.data.lines ?? []).some(
+          (l) =>
+            (Number(l.required_qty) || 0) > 0 &&
+            (Number(l.available_qty) || 0) <= 0,
+        )),
+  );
+  const canIssueMaterial = stockConfirmed && !stockCheckBlocksIssue;
+  // Once fully issued the request auto-shows as Completed, so the manual
+  // "Mark as Completed" action is only offered while it is still Material
+  // Issued but not yet fully fulfilled.
+  const canComplete =
+    effectiveStatus === "Material Issued" &&
+    isSubmitted &&
+    (canReviewMaterialRequest(role) || isOwner);
+  const allowCreateRfq = Boolean(mr && canCreateRfqFromMR(role));
+  // Edit is available on a Draft to the roles that can author MRs (Department
+  // User, Admin).
+  // Edit/Delete only while the ERP document is still an unsubmitted draft.
+  const canEditDraft =
+    isDraftDoc && isDraftWorkflow && canCreateMaterialRequest(role);
+  const hasLinkedRfq = Boolean(getLinkedRfqName(mr));
+  const showDelete =
+    isDraftDoc &&
+    isDraftWorkflow &&
+    canDeleteMaterialRequest(role, true);
+  const deleteBlocked = hasLinkedRfq;
+  const busy =
+    submitMutation.isPending ||
+    checkStockMutation.isPending ||
+    issueMutation.isPending ||
+    completeMutation.isPending ||
+    rejectMutation.isPending ||
+    deleteMutation.isPending;
+
+  return (
+    <div>
+      <Link
+        to={backPath}
+        className="mb-3 inline-flex items-center gap-1 text-sm text-neutral-500 no-underline hover:text-primary-600"
+      >
+        <ArrowLeft className="h-4 w-4" /> Back to Request History
+      </Link>
+
+      <PageHeader
+        title="Material Request Details"
+        description={cleanRemarks(mr.custom_purpose) || cleanRemarks(mr.remarks) || undefined}
+        actions={
+          <div className="flex flex-wrap items-center gap-2">
+            <StageBadge label={stageBadge.label} cls={stageBadge.cls} />
+            {slaVisible && activeSlaTimer ? <SlaBadge timer={activeSlaTimer} /> : null}
+            {canEditDraft ? (
+              <Link
+                to={`/material-requests/new?edit=${encodeURIComponent(mr.name)}`}
+                className="inline-flex items-center gap-2 rounded-lg border border-neutral-300 bg-white px-3 py-2 text-sm font-semibold text-neutral-700 no-underline hover:bg-neutral-50"
+              >
+                <Pencil className="h-4 w-4" />
+                Edit
+              </Link>
+            ) : null}
+            {canSubmit ? (
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => { if (!submitMutation.isPending) submitMutation.mutate(); }}
+                className="inline-flex items-center gap-2 rounded-lg bg-primary-600 px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-primary-700 disabled:opacity-60"
+              >
+                {submitMutation.isPending ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Send className="h-4 w-4" />
+                )}
+                {submitMutation.isPending ? "Submitting..." : "Submit Request"}
+              </button>
+            ) : null}
+            {showDelete ? (
+              <button
+                type="button"
+                disabled={busy || deleteBlocked}
+                onClick={() => setShowDeleteModal(true)}
+                title={
+                  deleteBlocked
+                    ? "Cannot delete because an RFQ has already been created."
+                    : undefined
+                }
+                className="inline-flex items-center gap-2 rounded-lg border border-danger bg-white px-3 py-2 text-sm font-semibold text-danger hover:bg-danger-50 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <Trash2 className="h-4 w-4" />
+                Delete
+              </button>
+            ) : null}
+            {canComplete ? (
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => completeMutation.mutate()}
+                className="inline-flex items-center gap-2 rounded-lg bg-emerald-600 px-3 py-2 text-sm font-semibold text-white"
+              >
+                {completeMutation.isPending ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <CheckCircle2 className="h-4 w-4" />
+                )}
+                Mark as Completed
+              </button>
+            ) : null}
+            <MrRfqActionControl
+              mr={mr}
+              allowCreate={allowCreateRfq}
+              createLabel="Create RFQ from MR"
+            />
+          </div>
+        }
+      />
+
+      {/* MR number — the header title is generic, so surface the identifier. */}
+      <div className="-mt-3 mb-5 flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-neutral-500">
+        <span className="font-mono font-semibold text-neutral-800">
+          {mr.name}
+        </span>
+        <ProcurementTypeBadge type={procurementType} />
+        <RequestModeBadge mode={requestMode} />
+        {/* Department is never shown in the Department User portal. */}
+        {role !== "department" && mr.custom_department ? (
+          <>
+            <span className="text-neutral-300">•</span>
+            <span>{mr.custom_department}</span>
+          </>
+        ) : null}
+      </div>
+
+      <WorkflowTimeline
+        status={effectiveStatus}
+        procurementInvolved={procurementInvolved}
+        progress={progress}
+        fullyIssued={isFullyIssued && !awaitingAcceptance && workflowStatus === "Completed"}
+      />
+
+      <div className="mb-6 grid grid-cols-2 gap-4 lg:grid-cols-3 xl:grid-cols-5">
+        {[
+          { label: "Request Date", value: formatDate(mr.transaction_date) },
+          { label: "Required Date", value: formatDate(mr.schedule_date) },
+          { label: "Requested By", value: requesterName },
+          ...(role === "department"
+            ? []
+            : [{ label: "Department", value: mr.custom_department }]),
+          { label: t("procurementType.label"), value: t(
+            procurementType === "Direct"
+              ? "procurementType.direct"
+              : "procurementType.indirect",
+          ) },
+          { label: t("requestMode.label"), value: t(
+            requestMode === "New" ? "requestMode.new" : "requestMode.existing",
+          ) },
+          { label: "Priority", value: mr.custom_priority },
+          { label: "Company", value: mr.company },
+        ]
+          .filter((f) => f.value && String(f.value).trim() && f.value !== "—")
+          .map((f) => (
+            <Info key={f.label} label={f.label} value={String(f.value)} />
+          ))}
+      </div>
+
+      <div className="card mb-6 overflow-hidden">
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-neutral-200 px-5 py-3">
+          <h3 className="text-sm font-bold">Requested Items</h3>
+          <div className="flex flex-wrap items-center gap-1.5">
+            <QtyChip label="Requested" value={fulfillment.totals.requested} tone="requested" />
+            <QtyChip label="Issued" value={fulfillment.totals.issued} tone="issued" />
+            <QtyChip label="Remaining" value={fulfillment.totals.remaining} tone="remaining" />
+            {procurementInvolved ? (
+              <QtyChip label="Procurement" value={fulfillment.totals.procurement} tone="procurement" />
+            ) : null}
+          </div>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="min-w-full text-sm">
+            <thead className="bg-neutral-50 text-xs uppercase text-neutral-500">
+              <tr>
+                <th className="px-4 py-2 text-left">Item Code</th>
+                <th className="px-4 py-2 text-left">Item Name</th>
+                <th className="px-4 py-2 text-right">Requested</th>
+                <th className="px-4 py-2 text-left">Part Name</th>
+                <th className="px-4 py-2 text-left">Attachments</th>
+                {showStock ? (
+                  <th className="px-4 py-2 text-right">Available</th>
+                ) : null}
+                <th className="px-4 py-2 text-right">Issued</th>
+                <th className="px-4 py-2 text-right">Remaining</th>
+                {procurementInvolved ? (
+                  <th className="px-4 py-2 text-right">Procurement</th>
+                ) : null}
+                <th className="px-4 py-2 text-left">Status</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-neutral-200">
+              {fulfillment.items.map((it) => {
+                const liveAvailable = availableByItem.get(it.item_code);
+                const availableQty =
+                  liveAvailable ?? (it.available != null ? it.available : null);
+                return (
+                  <tr key={it.item_code}>
+                    <td className="px-4 py-2 font-mono font-medium text-neutral-800">
+                      {it.item_code}
+                    </td>
+                    <td className="px-4 py-2 text-neutral-700">
+                      <div>{it.item_name}</div>
+                      <FulfillmentBar
+                        className="mt-1.5 max-w-[160px]"
+                        requested={it.requested}
+                        issued={it.issued}
+                        procurement={it.procurement}
+                      />
+                    </td>
+                    <td className="px-4 py-2 text-right tabular-nums">
+                      {it.requested} {it.uom}
+                    </td>
+                    <td className="px-4 py-2">
+                      <PartNameCell value={it.part_name} />
+                    </td>
+                    <td className="px-4 py-2">
+                      <Drawing2dCell
+                        url={it.drawing_2d_url}
+                        attachments={it.attachments}
+                      />
+                    </td>
+                    {showStock ? (
+                      <td className="px-4 py-2 text-right tabular-nums text-neutral-600">
+                        {availableQty == null ? (
+                          stockQuery.isLoading ? (
+                            <span className="text-neutral-400">…</span>
+                          ) : (
+                            `0 ${it.uom}`
+                          )
+                        ) : (
+                          `${availableQty} ${it.uom}`
+                        )}
+                      </td>
+                    ) : null}
+                    <td className="px-4 py-2 text-right font-semibold tabular-nums text-emerald-700">
+                      {it.issued} {it.uom}
+                    </td>
+                    <td className="px-4 py-2 text-right tabular-nums text-orange-700">
+                      {it.remaining} {it.uom}
+                    </td>
+                    {procurementInvolved ? (
+                      <td className="px-4 py-2 text-right tabular-nums text-blue-700">
+                        {it.procurement > 0 ? `${it.procurement} ${it.uom}` : "—"}
+                      </td>
+                    ) : null}
+                    <td className="px-4 py-2">
+                      <ItemStatusBadge status={it.status} />
+                    </td>
+                  </tr>
+                );
+              })}
+              {fulfillment.items.length === 0 ? (
+                <tr>
+                  <td
+                    colSpan={
+                      (procurementInvolved ? 11 : 10) - (showStock ? 0 : 1)
+                    }
+                    className="px-4 py-8 text-center text-neutral-500"
+                  >
+                    No items on this request.
+                  </td>
+                </tr>
+              ) : null}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {(() => {
+        const structuredProcessing = parseStructuredWarehouseProcessing(mr.custom_warehouse_remarks);
+        const hasStructured =
+          structuredProcessing.hasData ||
+          effectiveStatus === "Material Issued" ||
+          effectiveStatus === "Completed";
+        const warehouseRemarkText =
+          structuredProcessing.humanRemarks ||
+          cleanRemarks(mr.custom_warehouse_remarks) ||
+          (effectiveStatus === "Material Issued" || effectiveStatus === "Completed"
+            ? `Issued successfully${
+                warehouseName ? ` from ${warehouseName}` : ""
+              }.`
+            : "");
+        const procurementRemarkText = cleanRemarks(mr.custom_procurement_remarks);
+        const showProcurementRemarks =
+          procurementInvolved && Boolean(procurementRemarkText);
+
+        if (!hasStructured && !warehouseRemarkText && !showProcurementRemarks) return null;
+
+        return (
+          <div className="mb-6 space-y-4">
+            {hasStructured ? (
+              <div className="rounded-xl border border-slate-200/90 bg-white p-5 shadow-xs">
+                <div className="flex items-center gap-2 border-b border-slate-100 pb-3 mb-4">
+                  <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-sky-50 text-sky-700">
+                    <Warehouse className="h-4 w-4" />
+                  </span>
+                  <div>
+                    <h3 className="text-sm font-bold text-slate-900 uppercase tracking-wider">
+                      WAREHOUSE PROCESSING
+                    </h3>
+                    <p className="text-xs text-slate-500">
+                      Fulfillment summary and acceptance verification
+                    </p>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 text-xs">
+                  <div className="rounded-lg border border-slate-100 bg-slate-50/60 p-3">
+                    <span className="text-[11px] font-semibold text-slate-400 uppercase">Status</span>
+                    <div className="mt-1 flex items-center gap-1.5 font-bold text-emerald-800 text-sm">
+                      <Check className="h-4 w-4 text-emerald-600 stroke-[3]" />
+                      {structuredProcessing.status}
+                    </div>
+                  </div>
+
+                  <div className="rounded-lg border border-slate-100 bg-slate-50/60 p-3">
+                    <span className="text-[11px] font-semibold text-slate-400 uppercase">Material Issue Receipt</span>
+                    <div className="mt-1 font-mono font-bold text-slate-900 text-sm">
+                      {structuredProcessing.issueNumber}
+                    </div>
+                  </div>
+
+                  <div className="rounded-lg border border-slate-100 bg-slate-50/60 p-3">
+                    <span className="text-[11px] font-semibold text-slate-400 uppercase">Stock Entry</span>
+                    <div className="mt-1 font-mono font-bold text-slate-900 text-sm">
+                      {structuredProcessing.stockEntry}
+                    </div>
+                  </div>
+
+                  <div className="rounded-lg border border-slate-100 bg-slate-50/60 p-3">
+                    <span className="text-[11px] font-semibold text-slate-400 uppercase">Warehouse</span>
+                    <div className="mt-1 font-semibold text-slate-800 text-sm">
+                      {structuredProcessing.warehouse !== "—" ? structuredProcessing.warehouse : (warehouseName || "—")}
+                    </div>
+                  </div>
+
+                  <div className="rounded-lg border border-slate-100 bg-slate-50/60 p-3">
+                    <span className="text-[11px] font-semibold text-slate-400 uppercase">Received By</span>
+                    <div className="mt-1 font-semibold text-slate-800 text-sm">
+                      {structuredProcessing.receivedBy}
+                    </div>
+                  </div>
+
+                  <div className="rounded-lg border border-slate-100 bg-slate-50/60 p-3">
+                    <span className="text-[11px] font-semibold text-slate-400 uppercase">Issue Type</span>
+                    <div className="mt-1 font-semibold text-slate-800 text-sm">
+                      {structuredProcessing.issueType}
+                    </div>
+                  </div>
+
+                  <div className="rounded-lg border border-slate-100 bg-slate-50/60 p-3">
+                    <span className="text-[11px] font-semibold text-slate-400 uppercase">Issue Date</span>
+                    <div className="mt-1 font-semibold text-slate-800 text-sm">
+                      {structuredProcessing.issueDate}
+                    </div>
+                  </div>
+
+                  <div className="rounded-lg border border-slate-100 bg-slate-50/60 p-3">
+                    <span className="text-[11px] font-semibold text-slate-400 uppercase">Department Acceptance</span>
+                    <div className="mt-1 flex items-center gap-1.5 font-bold text-emerald-800 text-sm">
+                      {effectiveStatus === "Completed" || structuredProcessing.departmentAcceptance === "Confirmed" ? (
+                        <>
+                          <Check className="h-4 w-4 text-emerald-600 stroke-[3]" />
+                          Confirmed {structuredProcessing.acceptanceDate !== "—" ? `(${structuredProcessing.acceptanceDate})` : ""}
+                        </>
+                      ) : (
+                        <span className="text-amber-700">Pending</span>
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                {structuredProcessing.acceptanceChecklist && (
+                  <div className="mt-4 rounded-lg border border-slate-200/80 bg-slate-50/40 p-4">
+                    <h4 className="text-xs font-bold uppercase tracking-wider text-slate-700 mb-2.5">
+                      Acceptance Checklist
+                    </h4>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
+                      {(
+                        Object.keys(ACCEPTANCE_CHECKLIST_LABELS) as Array<
+                          keyof typeof ACCEPTANCE_CHECKLIST_LABELS
+                        >
+                      ).map((key) => {
+                        const checked = Boolean(structuredProcessing.acceptanceChecklist?.[key]);
+                        return (
+                          <div
+                            key={key}
+                            className="flex items-center gap-2 rounded-md bg-white border border-slate-200/80 px-3 py-2 text-xs font-medium text-slate-800 shadow-2xs"
+                          >
+                            {checked ? (
+                              <CheckCircle2 className="h-4 w-4 text-emerald-600 shrink-0" />
+                            ) : (
+                              <XCircle className="h-4 w-4 text-slate-300 shrink-0" />
+                            )}
+                            <span>{ACCEPTANCE_CHECKLIST_LABELS[key]}</span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
+                <div className="mt-4 rounded-lg border border-slate-100 bg-slate-50/60 p-4">
+                  <h4 className="text-xs font-bold uppercase tracking-wider text-slate-500 mb-1.5">
+                    Warehouse Remarks
+                  </h4>
+                  <p className="text-sm text-slate-700">
+                    {warehouseRemarkText || "No warehouse remarks added."}
+                  </p>
+                </div>
+
+                <div className="mt-4">
+                  <MaterialIssueAuditPanel
+                    audit={structuredProcessing.audit}
+                    documentHash={structuredProcessing.audit.document_hash}
+                    verificationToken={structuredProcessing.audit.verification_token}
+                  />
+                </div>
+              </div>
+            ) : warehouseRemarkText ? (
+              <div className="card p-5">
+                <h3 className="mb-2 text-sm font-bold">Warehouse Remarks</h3>
+                <p className="text-sm text-neutral-700">{warehouseRemarkText}</p>
+              </div>
+            ) : null}
+
+            {showProcurementRemarks ? (
+              <div className="card p-5">
+                <h3 className="mb-2 text-sm font-bold">Procurement Remarks</h3>
+                <p className="text-sm text-neutral-700">{procurementRemarkText}</p>
+              </div>
+            ) : null}
+          </div>
+        );
+      })()}
+
+      {canWarehouseAct ? (
+        <div className="card border-amber-200 bg-amber-50/30 p-5">
+          <h3 className="mb-3 text-sm font-bold text-amber-900">
+            Warehouse Actions
+          </h3>
+          <textarea
+            rows={2}
+            value={warehouseRemarks}
+            onChange={(e) => setWarehouseRemarks(e.target.value)}
+            placeholder="Warehouse remarks (optional)"
+            className="mb-4 w-full rounded-lg border border-neutral-200 px-3 py-2 text-sm"
+            disabled={busy}
+          />
+          <div className="mb-4 flex flex-wrap gap-2">
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => checkStockMutation.mutate()}
+              className="inline-flex items-center gap-2 rounded-lg border border-neutral-300 bg-white px-3 py-2 text-sm font-semibold"
+            >
+              {checkStockMutation.isPending ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : null}
+              Check Stock
+            </button>
+            {stockCheckBlocksIssue ? (
+              <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-800">
+                ⚠ No inventory available for one or more items. This request
+                must be forwarded to Procurement via Stock Decision.
+              </div>
+            ) : (
+              <button
+                type="button"
+                disabled={busy || !canIssueMaterial}
+                title={
+                  canIssueMaterial
+                    ? undefined
+                    : "Run a stock check first — Issue Material unlocks once stock is confirmed available."
+                }
+                onClick={() => issueMutation.mutate()}
+                className="inline-flex items-center gap-2 rounded-lg bg-emerald-600 px-3 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <Package className="h-4 w-4" />
+                Issue Material
+              </button>
+            )}
+            <Link
+              to={`/warehouse/material-requests/review/${encodeURIComponent(name)}`}
+              className="inline-flex items-center gap-2 rounded-lg bg-blue-600 px-3 py-2 text-sm font-semibold text-white no-underline"
+            >
+              <Truck className="h-4 w-4" />
+              Open Stock Decision
+            </Link>
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => rejectMutation.mutate()}
+              className="inline-flex items-center gap-2 rounded-lg bg-red-600 px-3 py-2 text-sm font-semibold text-white"
+            >
+              <XCircle className="h-4 w-4" />
+              Cancel Request
+            </button>
+          </div>
+          {checkStockMutation.data ? (
+            <div className="overflow-hidden rounded-lg border border-neutral-200 bg-white">
+              <table className="min-w-full text-sm">
+                <thead className="bg-neutral-50 text-xs uppercase text-neutral-500">
+                  <tr>
+                    <th className="px-3 py-2 text-left">Item</th>
+                    <th className="px-3 py-2 text-left">Warehouse</th>
+                    <th className="px-3 py-2 text-right">Required</th>
+                    <th className="px-3 py-2 text-right">Available</th>
+                    <th className="px-3 py-2 text-left">Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {checkStockMutation.data.lines.map((line) => (
+                    <tr
+                      key={`${line.item_code}-${line.warehouse}`}
+                      className="border-t border-neutral-100"
+                    >
+                      <td className="px-3 py-2">{line.item_code}</td>
+                      <td className="px-3 py-2">{line.warehouse}</td>
+                      <td className="px-3 py-2 text-right tabular-nums">
+                        {line.required_qty}
+                      </td>
+                      <td className="px-3 py-2 text-right tabular-nums">
+                        {Math.max(0, Number(line.available_qty) || 0)}
+                      </td>
+                      <td className="px-3 py-2">
+                        <span
+                          className={
+                            line.sufficient
+                              ? "text-emerald-700"
+                              : "font-semibold text-red-600"
+                          }
+                        >
+                          {line.sufficient ? "OK" : "Insufficient"}
+                        </span>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              {!checkStockMutation.data.all_sufficient ? (
+                <p className="border-t border-amber-100 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+                  Insufficient stock. Send this request to Procurement.
+                </p>
+              ) : null}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+
+      <ConfirmDialog
+        open={showDeleteModal}
+        onClose={() => {
+          if (!deleteMutation.isPending) setShowDeleteModal(false);
+        }}
+        onConfirm={() => deleteMutation.mutate()}
+        title="Delete Material Request"
+        description="Are you sure you want to permanently delete this Material Request? This action cannot be undone."
+        confirmLabel="Delete"
+        cancelLabel="Cancel"
+        tone="danger"
+        isLoading={deleteMutation.isPending}
+      />
+    </div>
+  );
+}
+
+function Info({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-xl border border-neutral-200 bg-white p-4 shadow-sm">
+      <p className="text-xs uppercase text-neutral-500">{label}</p>
+      <p className="mt-1 truncate text-sm font-medium">{value}</p>
+    </div>
+  );
+}

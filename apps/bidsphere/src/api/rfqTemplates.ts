@@ -1,0 +1,530 @@
+/**
+ * RFQ Template service — localStorage primary store with ERPNext sync when available.
+ */
+
+import {
+  apiGet,
+  apiPost,
+  apiPut,
+  buildResourceUrl,
+  buildListConfig,
+  isDocNotFoundError,
+  withSilent,
+  COMPANY as DEFAULT_COMPANY,
+} from "./erpnext";
+import type { ListParams } from "./erpnext";
+import type {
+  RFQ,
+  RFQTemplate,
+  RFQTemplateCategory,
+  RFQTemplateRfqType,
+  RFQTemplateStatus,
+  RFQTemplateItemRow,
+  RFQTemplateSupplierRow,
+  RFQTemplateRequiredDocuments,
+  RFQTemplateWorkflowRules,
+} from "../types/erpnext";
+import {
+  DEFAULT_REQUIRED_DOCUMENTS,
+  DEFAULT_WORKFLOW_RULES,
+} from "../types/erpnext";
+import { lookupDefaultWarehouse } from "./sourcing";
+import { assertSuppliersActive } from "./supplier";
+import { assertERPNextDate, todayERPNextDate } from "../utils/erpNextDate";
+import {
+  createLocalTemplate,
+  getLocalTemplate,
+  incrementLocalTemplateUsage,
+  isLocalTemplateId,
+  logTemplateStorage,
+  mergeTemplateLists,
+  saveLocalTemplate,
+} from "./rfqTemplateStorage";
+import {
+  buildMetaFromTemplate,
+  stashRFQCreationMeta,
+} from "./rfqCreationMeta";
+import { ensureStandardTemplatesPopulated } from "./rfqTemplatePopulation";
+
+const TEMPLATE_DOCTYPE = "RFQ Template";
+const TEMPLATE_ITEM_DOCTYPE = "RFQ Template Item";
+const TEMPLATE_SUPPLIER_DOCTYPE = "RFQ Template Supplier";
+const RFQ_DOCTYPE = "Request for Quotation";
+const RFQ_ITEM_DOCTYPE = "Request for Quotation Item";
+const RFQ_SUPPLIER_DOCTYPE = "Request for Quotation Supplier";
+
+export const RFQ_TEMPLATE_CATEGORIES: RFQTemplateCategory[] = [
+  "Raw Materials Procurement",
+  "Spare Parts & Maintenance",
+  "Office Supplies",
+  "Electrical & Industrial Components",
+  "General Procurement",
+  "Raw Materials",
+  "Manufacturing Components",
+  "Electrical Components",
+  "Packaging Materials",
+  "MRO Supplies",
+  "Warehouse Consumables",
+  "IT Equipment",
+  "Logistics & Transportation",
+];
+
+export const RFQ_TEMPLATE_RFQ_TYPES: RFQTemplateRfqType[] = [
+  "Standard RFQ",
+  "Single Source",
+  "Emergency",
+  "Framework Agreement",
+  "Services",
+];
+
+export let usingFallbackTemplates = false;
+
+export interface RFQTemplateInput {
+  template_name: string;
+  category: RFQTemplateCategory;
+  procurement_type?: "Direct" | "Indirect";
+  rfq_type?: RFQTemplateRfqType;
+  description?: string;
+  status?: RFQTemplateStatus;
+  estimated_value?: number;
+  cost_breakdown_required?: boolean;
+  contract_required?: boolean;
+  supplier_terms?: string;
+  items?: Array<{
+    item_code: string;
+    item_name?: string;
+    description?: string;
+    qty?: number | string;
+    uom?: string;
+    target_price?: number;
+    specification?: string;
+    schedule_date?: string;
+    delivery_date?: string;
+    required_by?: string;
+  }>;
+  suppliers?: Array<{ supplier: string; supplier_name?: string }>;
+  required_documents?: RFQTemplateRequiredDocuments;
+  workflow_rules?: RFQTemplateWorkflowRules;
+}
+
+function validateTemplateInput(data: RFQTemplateInput): void {
+  if (!data.template_name?.trim()) throw new Error("Template name is required.");
+  if (!data.category?.trim()) throw new Error("Template category is required.");
+}
+
+function mapInputToTemplate(
+  data: RFQTemplateInput,
+  existing?: RFQTemplate
+): Omit<RFQTemplate, "name" | "creation" | "modified" | "owner"> & {
+  name?: string;
+} {
+  return {
+    name: existing?.name,
+    template_name: data.template_name.trim(),
+    category: data.category,
+    procurement_type: data.procurement_type ?? existing?.procurement_type ?? "Direct",
+    rfq_type: data.rfq_type ?? "Standard RFQ",
+    description: data.description ?? "",
+    status: data.status ?? existing?.status ?? "Active",
+    estimated_value: data.estimated_value ?? 0,
+    usage_count: existing?.usage_count ?? 0,
+    last_used_at: existing?.last_used_at,
+    cost_breakdown_required:
+      data.cost_breakdown_required ?? existing?.cost_breakdown_required ?? false,
+    contract_required:
+      data.contract_required ?? existing?.contract_required ?? false,
+    supplier_terms: data.supplier_terms ?? existing?.supplier_terms ?? "",
+    items: (data.items ?? []).map(
+      (item, i) =>
+        ({
+          name: existing?.items?.[i]?.name ?? `item-${i}`,
+          item_code: item.item_code,
+          item_name: item.item_name || item.item_code,
+          description: item.description ?? item.item_name ?? item.item_code,
+          qty: item.qty != null ? Number(item.qty) || 1 : undefined,
+          uom: item.uom || "Nos",
+          target_price: item.target_price ?? 0,
+          specification: item.specification ?? "",
+        }) as RFQTemplateItemRow
+    ),
+    suppliers: (data.suppliers ?? []).map(
+      (s, i) =>
+        ({
+          name: existing?.suppliers?.[i]?.name ?? `sup-${i}`,
+          supplier: s.supplier,
+          supplier_name: s.supplier_name || s.supplier,
+        }) as RFQTemplateSupplierRow
+    ),
+    required_documents: data.required_documents ?? {
+      ...DEFAULT_REQUIRED_DOCUMENTS,
+    },
+    workflow_rules: data.workflow_rules ?? { ...DEFAULT_WORKFLOW_RULES },
+  };
+}
+
+function buildErpPayload(data: RFQTemplateInput): Record<string, unknown> {
+  return {
+    doctype: TEMPLATE_DOCTYPE,
+    template_name: data.template_name,
+    category: data.category,
+    description: JSON.stringify({
+      procurement_type: data.procurement_type,
+      rfq_type: data.rfq_type,
+      required_documents: data.required_documents,
+      workflow_rules: data.workflow_rules,
+      cost_breakdown_required: data.cost_breakdown_required,
+      contract_required: data.contract_required,
+      supplier_terms: data.supplier_terms,
+      note: data.description,
+    }),
+    status: data.status ?? "Active",
+    estimated_value: data.estimated_value ?? 0,
+    usage_count: 0,
+    items: (data.items ?? []).map((item) => ({
+      doctype: TEMPLATE_ITEM_DOCTYPE,
+      item_code: item.item_code,
+      item_name: item.item_name || item.item_code,
+      description: item.description || item.specification || item.item_name || item.item_code,
+      qty: Number(item.qty) || 1,
+      uom: item.uom || "Nos",
+    })),
+    suppliers: (data.suppliers ?? []).map((s) => ({
+      doctype: TEMPLATE_SUPPLIER_DOCTYPE,
+      supplier: s.supplier,
+      supplier_name: s.supplier_name || s.supplier,
+    })),
+  };
+}
+
+/** List templates — localStorage merged with ERPNext when available. */
+export async function getRFQTemplates(
+  params?: ListParams
+): Promise<RFQTemplate[]> {
+  logTemplateStorage("FETCH list — start");
+  const local = ensureStandardTemplatesPopulated();
+
+  try {
+    const result = await apiGet<RFQTemplate[]>(
+      buildResourceUrl(TEMPLATE_DOCTYPE),
+      withSilent(
+        buildListConfig({
+          fields: [
+            "name",
+            "template_name",
+            "category",
+            "description",
+            "status",
+            "estimated_value",
+            "usage_count",
+            "modified",
+            "creation",
+            "owner",
+          ],
+          limit_page_length: 200,
+          order_by: "modified desc",
+          ...params,
+        })
+      )
+    );
+    usingFallbackTemplates = false;
+    const erp = Array.isArray(result) ? result : [];
+    const merged = mergeTemplateLists(erp, local);
+    logTemplateStorage("FETCH list — merged", { erp: erp.length, local: local.length, total: merged.length });
+    return merged;
+  } catch (err) {
+    if (isDocNotFoundError(err) || local.length > 0) {
+      usingFallbackTemplates = true;
+      if (local.length > 0) {
+        logTemplateStorage("FETCH list — local only", { count: local.length });
+        return local;
+      }
+      logTemplateStorage("FETCH list — empty (no ERPNext templates)");
+      return [];
+    }
+    throw err;
+  }
+}
+
+/** Get single template with child tables. */
+export async function getRFQTemplate(name: string): Promise<RFQTemplate> {
+  logTemplateStorage("FETCH one", { name });
+  const local = getLocalTemplate(name);
+  if (local) return local;
+
+  if (!isLocalTemplateId(name)) {
+    try {
+      const erp = await apiGet<RFQTemplate>(
+        buildResourceUrl(TEMPLATE_DOCTYPE, name),
+        withSilent()
+      );
+      return normalizeErpTemplate(erp);
+    } catch {
+      /* fall through */
+    }
+  }
+
+  const all = await getRFQTemplates();
+  const found = all.find((t) => t.name === name);
+  if (found) return found;
+  throw new Error(`Template "${name}" not found.`);
+}
+
+function normalizeErpTemplate(raw: RFQTemplate): RFQTemplate {
+  let rfq_type: RFQTemplateRfqType | undefined;
+  let procurement_type: "Direct" | "Indirect" | undefined = raw.procurement_type;
+  let cost_breakdown_required = raw.cost_breakdown_required ?? false;
+  let contract_required = raw.contract_required ?? false;
+  let supplier_terms = raw.supplier_terms ?? "";
+  let required_documents = { ...DEFAULT_REQUIRED_DOCUMENTS };
+  let workflow_rules = { ...DEFAULT_WORKFLOW_RULES };
+  let description = raw.description ?? "";
+
+  try {
+    if (description.startsWith("{")) {
+      const cfg = JSON.parse(description) as {
+        rfq_type?: RFQTemplateRfqType;
+        procurement_type?: "Direct" | "Indirect";
+        cost_breakdown_required?: boolean;
+        contract_required?: boolean;
+        supplier_terms?: string;
+        required_documents?: RFQTemplateRequiredDocuments;
+        workflow_rules?: RFQTemplateWorkflowRules;
+        note?: string;
+      };
+      rfq_type = cfg.rfq_type;
+      if (cfg.procurement_type) procurement_type = cfg.procurement_type;
+      if (cfg.cost_breakdown_required !== undefined) cost_breakdown_required = cfg.cost_breakdown_required;
+      if (cfg.contract_required !== undefined) contract_required = cfg.contract_required;
+      if (cfg.supplier_terms) supplier_terms = cfg.supplier_terms;
+      if (cfg.required_documents) required_documents = cfg.required_documents;
+      if (cfg.workflow_rules) workflow_rules = cfg.workflow_rules;
+      if (cfg.note) description = cfg.note;
+    }
+  } catch {
+    /* plain description */
+  }
+
+  return {
+    ...raw,
+    procurement_type: procurement_type ?? "Direct",
+    rfq_type: rfq_type ?? "Standard RFQ",
+    cost_breakdown_required,
+    contract_required,
+    supplier_terms,
+    description,
+    required_documents,
+    workflow_rules,
+    items: raw.items ?? [],
+    suppliers: raw.suppliers ?? [],
+  };
+}
+
+export async function createRFQTemplate(
+  data: RFQTemplateInput
+): Promise<RFQTemplate> {
+  validateTemplateInput(data);
+  logTemplateStorage("CREATE — start", data.template_name);
+
+  const saved = createLocalTemplate(mapInputToTemplate(data));
+
+  try {
+    const erp = await apiPost<RFQTemplate>(
+      buildResourceUrl(TEMPLATE_DOCTYPE),
+      buildErpPayload(data)
+    );
+    saveLocalTemplate({ ...saved, name: erp.name });
+    logTemplateStorage("CREATE — ERPNext synced", erp.name);
+    return getLocalTemplate(erp.name) ?? saved;
+  } catch (err) {
+    logTemplateStorage("CREATE — local only", { name: saved.name, err });
+    return saved;
+  }
+}
+
+export async function updateRFQTemplate(
+  name: string,
+  data: Partial<RFQTemplateInput>
+): Promise<RFQTemplate> {
+  const existing = await getRFQTemplate(name);
+  const merged: RFQTemplateInput = {
+    template_name: data.template_name ?? existing.template_name,
+    category: data.category ?? existing.category,
+    rfq_type: data.rfq_type ?? existing.rfq_type,
+    description: data.description ?? existing.description,
+    status: data.status ?? existing.status,
+    estimated_value: data.estimated_value ?? existing.estimated_value,
+    items:
+      data.items ??
+      existing.items.map((i) => ({
+        item_code: i.item_code,
+        item_name: i.item_name,
+        qty: i.qty,
+        uom: i.uom,
+        target_price: i.target_price,
+        specification: i.specification,
+      })),
+    suppliers:
+      data.suppliers ??
+      existing.suppliers.map((s) => ({
+        supplier: s.supplier,
+        supplier_name: s.supplier_name,
+      })),
+    required_documents: data.required_documents ?? existing.required_documents,
+    workflow_rules: data.workflow_rules ?? existing.workflow_rules,
+  };
+  validateTemplateInput(merged);
+
+  const saved = saveLocalTemplate({
+    ...existing,
+    ...mapInputToTemplate(merged, existing),
+    name: existing.name,
+    creation: existing.creation,
+    owner: existing.owner,
+  });
+
+  if (!isLocalTemplateId(name)) {
+    try {
+      await apiPut(buildResourceUrl(TEMPLATE_DOCTYPE, name), buildErpPayload(merged));
+      logTemplateStorage("UPDATE — ERPNext synced", name);
+    } catch {
+      logTemplateStorage("UPDATE — local only", name);
+    }
+  }
+  return saved;
+}
+
+export async function cloneRFQTemplate(
+  sourceName: string,
+  newName?: string
+): Promise<RFQTemplate> {
+  const source = await getRFQTemplate(sourceName);
+  return createRFQTemplate({
+    template_name: newName ?? `${source.template_name} (Copy)`,
+    category: source.category,
+    rfq_type: source.rfq_type,
+    description: source.description,
+    estimated_value: source.estimated_value,
+    items: source.items.map((i) => ({
+      item_code: i.item_code,
+      item_name: i.item_name,
+      qty: i.qty,
+      uom: i.uom,
+      target_price: i.target_price,
+      specification: i.specification,
+    })),
+    suppliers: source.suppliers.map((s) => ({
+      supplier: s.supplier,
+      supplier_name: s.supplier_name,
+    })),
+    required_documents: source.required_documents,
+    workflow_rules: source.workflow_rules,
+    status: "Active",
+  });
+}
+
+export async function archiveRFQTemplate(name: string): Promise<RFQTemplate> {
+  return updateRFQTemplate(name, { status: "Archived" });
+}
+
+export async function activateRFQTemplate(name: string): Promise<RFQTemplate> {
+  return updateRFQTemplate(name, { status: "Active" });
+}
+
+export async function deactivateRFQTemplate(name: string): Promise<RFQTemplate> {
+  return updateRFQTemplate(name, { status: "Inactive" });
+}
+
+/* ─── Create RFQ from template ────────────────────────────────────────────── */
+
+export interface CreateRFQFromTemplateInput {
+  template_id: string;
+  rfq_name?: string;
+}
+
+export function stashRFQTemplateMeta(
+  rfqName: string,
+  template: RFQTemplate
+): void {
+  stashRFQCreationMeta(rfqName, buildMetaFromTemplate(template));
+}
+
+export async function createRFQFromTemplate(
+  input: CreateRFQFromTemplateInput
+): Promise<RFQ> {
+  logTemplateStorage("CREATE RFQ from template", input);
+  const template = await getRFQTemplate(input.template_id);
+
+  if (!template.items?.length) throw new Error("Template has no items.");
+  if (!template.suppliers?.length) throw new Error("Template has no suppliers.");
+
+  await assertSuppliersActive(template.suppliers.map((s) => s.supplier));
+
+  const today = todayERPNextDate();
+  const company = DEFAULT_COMPANY;
+  const warehouse = await lookupDefaultWarehouse(company);
+
+  const docLines: string[] = [];
+  if (template.description) docLines.push(template.description);
+  if (template.supplier_terms?.trim()) docLines.push(`Supplier Terms:\n${template.supplier_terms.trim()}`);
+  if (template.rfq_type) docLines.push(`RFQ Type: ${template.rfq_type}`);
+  const req = template.required_documents;
+  if (req) {
+    const docs = [
+      req.terms_and_conditions && "Terms & Conditions",
+      req.warranty_certificate && "Warranty Certificate",
+      req.insurance_certificate && "Insurance Certificate",
+      req.nda && "NDA",
+      req.compliance_certificate && "Compliance Certificate",
+    ].filter(Boolean);
+    if (docs.length) docLines.push(`Required Documents: ${docs.join(", ")}`);
+  }
+
+  const payload = {
+    doctype: RFQ_DOCTYPE,
+    transaction_date: assertERPNextDate(today, "transaction_date"),
+    status: "Draft",
+    company,
+    custom_procurement_type: template.procurement_type ?? "Direct",
+    custom_procurement_category: template.category,
+    custom_require_cost_breakdown: template.cost_breakdown_required ? 1 : 0,
+    message_for_supplier: [input.rfq_name || template.template_name, ...docLines].join("\n\n"),
+    items: template.items.map((item) => ({
+      doctype: RFQ_ITEM_DOCTYPE,
+      item_code: item.item_code,
+      item_name: item.item_name || item.item_code,
+      description: item.specification || item.item_name || item.item_code,
+      qty: Number(item.qty) || 1,
+      uom: item.uom || "Nos",
+      stock_uom: item.uom || "Nos",
+      conversion_factor: 1,
+      warehouse,
+      schedule_date: today,
+      custom_target_price:
+        item.target_price != null && Number(item.target_price) >= 0
+          ? Number(item.target_price)
+          : undefined,
+    })),
+    suppliers: template.suppliers.map((s) => ({
+      doctype: RFQ_SUPPLIER_DOCTYPE,
+      supplier: s.supplier,
+      supplier_name: s.supplier_name || s.supplier,
+    })),
+  };
+
+  const rfq = await apiPost<RFQ>(buildResourceUrl(RFQ_DOCTYPE), payload);
+  stashRFQTemplateMeta(rfq.name, template);
+  incrementLocalTemplateUsage(template.name);
+
+  try {
+    if (!isLocalTemplateId(template.name)) {
+      await apiPut(buildResourceUrl(TEMPLATE_DOCTYPE, template.name), {
+        usage_count: (template.usage_count ?? 0) + 1,
+      });
+    }
+  } catch {
+    /* non-critical */
+  }
+
+  logTemplateStorage("CREATE RFQ from template — done", rfq.name);
+  return rfq;
+}

@@ -1,0 +1,610 @@
+/**
+ * Legal Reviews API service.
+ *
+ * Data source: ERPNext is the SINGLE SOURCE OF TRUTH.
+ *
+ * All review data is read from ERPNext custom fields on the RFQ DocType.
+ * localStorage may cache per-RFQ state for the detail page only.
+ * Listing and Review History NEVER read from localStorage — only ERPNext.
+ */
+
+import { apiGet, buildResourceUrl } from "./erpnext";
+import {
+  getApprovalState,
+  saveApprovalState,
+  syncApprovalStateToErpNext,
+} from "./rfqApprovalWorkflow";
+import { getLegalDocsByRfq, resubmitLegalReview as resubmitLegalReviewApi } from "./legalDocs";
+import { getRFQSchema } from "./rfqSchema";
+import type {
+  RFQApprovalState,
+  LegalReviewStatus,
+  FinanceReviewStatus,
+  LegalReviewItem,
+  LegalComment,
+} from "../types/erpnext";
+import { nowERPDateTime } from "../utils/erpDate";
+
+export type LegalReviewFilterStatus = LegalReviewStatus | "All";
+
+export interface LegalReviewListParams {
+  status?: LegalReviewFilterStatus;
+  limit?: number;
+}
+
+const RFQ_DOCTYPE = "Request for Quotation";
+const LOG_TAG = "[LegalReviews]";
+
+/* ────────────────────────────────────────────────────────────────────────────
+ *  Main query — ERPNext is the SINGLE SOURCE OF TRUTH
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+export async function getLegalReviews(
+  params?: LegalReviewListParams
+): Promise<LegalReviewItem[]> {
+  const filter = params?.status ?? "Pending Legal Review";
+  // eslint-disable-next-line no-console
+  console.log(LOG_TAG, "getLegalReviews called — source: ERPNext API, filter:", filter);
+
+  const items: LegalReviewItem[] = [];
+  const seen = new Set<string>();
+
+  // ── Step 1: Fetch ALL submitted RFQs from ERPNext ─────────────────────
+  const erpMap = await fetchErpNextRFQs();
+  // eslint-disable-next-line no-console
+  console.log(LOG_TAG, "Legal Reviews Source: ERPNext API");
+  // eslint-disable-next-line no-console
+  console.log(LOG_TAG, `Fetched ${erpMap.size} submitted RFQs from ERPNext:`,
+    [...erpMap.keys()]);
+
+  // ── Step 2: Build review items from ERPNext custom fields ─────────────
+  for (const [rfqName, erpRfq] of erpMap) {
+    const state = buildStateFromErpRfq(erpRfq);
+    if (!state) continue;
+
+    // Cache for detail page only — listing never reads localStorage
+    try {
+      localStorage.setItem(`rfq_approval_${state.rfq}`, JSON.stringify(state));
+    } catch { /* ignore quota errors */ }
+
+    const item = toReviewItem(state, erpRfq);
+    if (filter !== "All" && item.legal_status !== filter) continue;
+
+    items.push(item);
+    seen.add(rfqName);
+  }
+
+  // eslint-disable-next-line no-console
+  console.log(LOG_TAG, `Loaded Reviews: ${items.length} (filter="${filter}", ERPNext: ${seen.size})`);
+
+  items.sort(
+    (a, b) => (b.submission_date ?? "").localeCompare(a.submission_date ?? "")
+  );
+
+  if (params?.limit && items.length > params.limit) {
+    return items.slice(0, params.limit);
+  }
+
+  return items;
+}
+
+export function buildStateFromErpRfq(erpRfq: ErpRFQRow): RFQApprovalState | null {
+  const fromJson = tryRestoreFromApprovalData(erpRfq);
+  if (fromJson) return fromJson;
+
+  const mappedLegal = mapErpLegalStatus(erpRfq.custom_legal_status ?? "");
+  const legalApproved = mappedLegal === "Approved";
+
+  const hasErpWorkflowData =
+    erpRfq.custom_legal_status ||
+    erpRfq.custom_selected_supplier ||
+    erpRfq.custom_workflow_step ||
+    erpRfq.custom_legal_reviewer ||
+    erpRfq.custom_legal_review_date ||
+    erpRfq.custom_legal_comments;
+
+  const hasFinanceWorkflow =
+    erpRfq.custom_finance_status ||
+    erpRfq.custom_finance_reviewer ||
+    erpRfq.custom_finance_review_date;
+
+  if (!hasErpWorkflowData && !hasFinanceWorkflow && !legalApproved) return null;
+
+  const mappedFinance = mapErpFinanceStatus(erpRfq.custom_finance_status ?? "");
+  const financeStatus: FinanceReviewStatus =
+    legalApproved && !erpRfq.custom_finance_status
+      ? "Pending Finance Review"
+      : mappedFinance;
+  const legalComments = parseErpLegalComments(
+    erpRfq.custom_legal_comments,
+    erpRfq.custom_legal_reviewer,
+    erpRfq.custom_legal_review_date,
+    mappedLegal
+  );
+
+  return {
+    rfq: erpRfq.name,
+    rfq_title: parseRfqTitle(erpRfq.message_for_supplier),
+    company: erpRfq.company,
+    selected_supplier: erpRfq.custom_selected_supplier ?? "",
+    selected_supplier_total: erpRfq.custom_selected_supplier_total ?? 0,
+    workflow_step:
+      (erpRfq.custom_workflow_step as RFQApprovalState["workflow_step"]) ??
+      (mappedLegal === "Approved"
+        ? "Pending Finance Review"
+        : mappedLegal === "Rejected"
+          ? "Legal Rejected"
+          : "Pending Legal Review"),
+    legal_status: mappedLegal,
+    finance_status: financeStatus,
+    submitted_by: erpRfq.custom_submitted_by ?? erpRfq.owner ?? "",
+    submitted_at: erpRfq.custom_submitted_at ?? erpRfq.creation ?? new Date().toISOString(),
+    legal_reviewer: erpRfq.custom_legal_reviewer,
+    legal_review_date: erpRfq.custom_legal_review_date,
+    finance_reviewer: erpRfq.custom_finance_reviewer,
+    finance_review_date: erpRfq.custom_finance_review_date,
+    legal_comments: legalComments,
+    finance_comments: [],
+    terms_approved: !!erpRfq.custom_terms_approved,
+    warranty_approved: !!erpRfq.custom_warranty_approved,
+    insurance_approved: !!erpRfq.custom_insurance_approved,
+  };
+}
+
+function parseErpLegalComments(
+  remarks: string | undefined,
+  reviewer: string | undefined,
+  reviewedOn: string | undefined,
+  action: LegalReviewStatus
+): LegalComment[] {
+  const text = remarks?.trim();
+  if (!text) return [];
+  return [
+    {
+      comment: text,
+      comment_by: reviewer ?? "",
+      comment_date: reviewedOn ?? "",
+      action,
+    },
+  ];
+}
+
+/* ────────────────────────────────────────────────────────────────────────────
+ *  Internal: ERPNext fetch with retry
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+export interface ErpRFQRow {
+  name: string;
+  company?: string;
+  creation?: string;
+  transaction_date?: string;
+  owner?: string;
+  message_for_supplier?: string;
+  custom_legal_status?: string;
+  custom_finance_status?: string;
+  custom_selected_supplier?: string;
+  custom_selected_supplier_total?: number;
+  custom_workflow_step?: string;
+  custom_submitted_by?: string;
+  custom_submitted_at?: string;
+  custom_legal_reviewer?: string;
+  custom_legal_review_date?: string;
+  custom_legal_comments?: string;
+  custom_finance_reviewer?: string;
+  custom_finance_review_date?: string;
+  custom_finance_comments?: string;
+  custom_approval_data?: string;
+  custom_terms_approved?: number;
+  custom_warranty_approved?: number;
+  custom_insurance_approved?: number;
+  custom_cost_center?: string;
+  custom_department?: string;
+  custom_budget_reference?: string;
+  [key: string]: unknown;
+}
+
+const WORKFLOW_CUSTOM_FIELDS = [
+  "custom_legal_status",
+  "custom_finance_status",
+  "custom_selected_supplier",
+  "custom_selected_supplier_total",
+  "custom_workflow_step",
+  "custom_submitted_by",
+  "custom_submitted_at",
+  "custom_legal_reviewer",
+  "custom_legal_review_date",
+  "custom_legal_comments",
+  "custom_finance_reviewer",
+  "custom_finance_review_date",
+  "custom_finance_comments",
+  "custom_approval_data",
+  "custom_terms_approved",
+  "custom_warranty_approved",
+  "custom_insurance_approved",
+  "custom_cost_center",
+  "custom_department",
+  "custom_budget_reference",
+];
+
+/**
+ * Fetch a single RFQ's workflow custom fields from ERPNext and derive its
+ * approval state — used to hydrate the Procurement RFQ Detail page when its
+ * localStorage cache is empty (e.g. first visit from a new browser/device).
+ * ERPNext's `custom_*` fields (backed up by `custom_approval_data`) are the
+ * durable source of truth; localStorage is only ever a same-session cache.
+ */
+export async function getApprovalStateFromErp(
+  rfqName: string
+): Promise<RFQApprovalState | null> {
+  if (!rfqName) return null;
+  try {
+    const schema = await getRFQSchema();
+    const fieldSet = new Set(schema.allFields);
+    const availableCustomFields = WORKFLOW_CUSTOM_FIELDS.filter((f) =>
+      fieldSet.has(f)
+    );
+    const fields = [
+      "name",
+      "company",
+      "creation",
+      "transaction_date",
+      "owner",
+      "message_for_supplier",
+      ...availableCustomFields,
+    ];
+    const rows = await apiGet<ErpRFQRow[]>(buildResourceUrl(RFQ_DOCTYPE), {
+      params: {
+        fields: JSON.stringify(fields),
+        filters: JSON.stringify([["name", "=", rfqName]]),
+        limit_page_length: 1,
+      },
+    });
+    const erpRfq = Array.isArray(rows) ? rows[0] : undefined;
+    if (!erpRfq) return null;
+
+    const state = buildStateFromErpRfq(erpRfq);
+    if (state) {
+      try {
+        localStorage.setItem(`rfq_approval_${state.rfq}`, JSON.stringify(state));
+      } catch {
+        /* ignore quota errors — ERPNext remains the source of truth */
+      }
+    }
+    return state;
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn(LOG_TAG, `getApprovalStateFromErp(${rfqName}) failed:`, err);
+    return null;
+  }
+}
+
+export async function fetchErpNextRFQs(): Promise<Map<string, ErpRFQRow>> {
+  const map = new Map<string, ErpRFQRow>();
+
+  const safeFields = ["name", "company", "creation", "transaction_date", "owner", "message_for_supplier"];
+
+  let availableCustomFields: string[] = [];
+  let legalFieldName: string | null = null;
+  try {
+    const schema = await getRFQSchema();
+    legalFieldName = schema.legalStatusFieldName;
+    const fieldSet = new Set(schema.allFields);
+    availableCustomFields = WORKFLOW_CUSTOM_FIELDS.filter((f) => fieldSet.has(f));
+    // eslint-disable-next-line no-console
+    console.log(LOG_TAG, "Available workflow fields:", availableCustomFields);
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn(LOG_TAG, "Schema discovery failed:", err);
+  }
+
+  // Include the legal field name if it's different from custom_legal_status
+  if (legalFieldName && !availableCustomFields.includes(legalFieldName)) {
+    availableCustomFields.push(legalFieldName);
+  }
+
+  const allRequestedFields = [...safeFields, ...availableCustomFields];
+
+  let rfqs: ErpRFQRow[] | null = null;
+
+  // Attempt 1: with all custom fields
+  try {
+    const result = await apiGet<ErpRFQRow[]>(
+      buildResourceUrl(RFQ_DOCTYPE),
+      {
+        params: {
+          fields: JSON.stringify(allRequestedFields),
+          filters: JSON.stringify([["docstatus", "=", 1]]),
+          limit_page_length: 200,
+          order_by: "creation desc",
+        },
+      }
+    );
+    if (Array.isArray(result)) {
+      rfqs = result;
+    } else {
+      // eslint-disable-next-line no-console
+      console.warn(LOG_TAG, "ERPNext returned non-array:", typeof result, result);
+    }
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn(LOG_TAG, "ERPNext fetch attempt 1 failed:", err);
+  }
+
+  // Attempt 2: safe fields only
+  if (!rfqs) {
+    try {
+      // eslint-disable-next-line no-console
+      console.log(LOG_TAG, "Retrying ERPNext fetch with safe fields only...");
+      const result = await apiGet<ErpRFQRow[]>(
+        buildResourceUrl(RFQ_DOCTYPE),
+        {
+          params: {
+            fields: JSON.stringify(safeFields),
+            filters: JSON.stringify([["docstatus", "=", 1]]),
+            limit_page_length: 200,
+            order_by: "creation desc",
+          },
+        }
+      );
+      if (Array.isArray(result)) rfqs = result;
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn(LOG_TAG, "ERPNext fetch attempt 2 also failed:", err);
+    }
+  }
+
+  if (rfqs) {
+    for (const rfq of rfqs) {
+      if (rfq?.name) {
+        if (legalFieldName && legalFieldName !== "custom_legal_status" && rfq[legalFieldName]) {
+          rfq.custom_legal_status = rfq[legalFieldName] as string;
+        }
+        map.set(rfq.name, rfq);
+      }
+    }
+  }
+
+  return map;
+}
+
+/* ────────────────────────────────────────────────────────────────────────────
+ *  Helpers
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+function toReviewItem(
+  state: RFQApprovalState,
+  erpData?: ErpRFQRow | null
+): LegalReviewItem {
+  return {
+    rfq_name: state.rfq,
+    rfq_title: state.rfq_title,
+    company: state.company ?? erpData?.company ?? "",
+    supplier: state.selected_supplier,
+    rfq_value: state.selected_supplier_total,
+    submission_date: state.submitted_at,
+    created_by: state.submitted_by,
+    legal_status: state.legal_status,
+    legal_reviewer: state.legal_reviewer,
+    legal_review_date: state.legal_review_date,
+    legal_comments: state.legal_comments ?? [],
+    finance_status: state.finance_status,
+    finance_reviewer: state.finance_reviewer,
+    finance_review_date: state.finance_review_date,
+    workflow_step: state.workflow_step,
+    terms_approved: state.terms_approved,
+    warranty_approved: state.warranty_approved,
+    insurance_approved: state.insurance_approved,
+  };
+}
+
+export function mapErpLegalStatus(erpStatus: string): LegalReviewStatus {
+  if (erpStatus === "Changes Requested") return "Rejected";
+  const map: Record<string, LegalReviewStatus> = {
+    Pending: "Pending Legal Review",
+    "Pending Legal Review": "Pending Legal Review",
+    Approved: "Approved",
+    Rejected: "Rejected",
+  };
+  return map[erpStatus] ?? "Pending Legal Review";
+}
+
+export function mapErpFinanceStatus(erpStatus: string): FinanceReviewStatus {
+  if (erpStatus === "Clarification Requested") return "Rejected";
+  const map: Record<string, FinanceReviewStatus> = {
+    Pending: "Pending Finance Review",
+    "Pending Finance Review": "Pending Finance Review",
+    Approved: "Budget Approved",
+    "Budget Approved": "Budget Approved",
+    Rejected: "Rejected",
+  };
+  return map[erpStatus] ?? "Pending Finance Review";
+}
+
+export function tryRestoreFromApprovalData(erpRfq: ErpRFQRow): RFQApprovalState | null {
+  const jsonBlob = erpRfq.custom_approval_data;
+  if (!jsonBlob || typeof jsonBlob !== "string") return null;
+  try {
+    const parsed = JSON.parse(jsonBlob) as RFQApprovalState;
+    if (parsed?.rfq && parsed?.legal_status) return parsed;
+  } catch {
+    // eslint-disable-next-line no-console
+    console.warn(LOG_TAG, `Corrupt custom_approval_data for ${erpRfq.name}`);
+  }
+  return null;
+}
+
+export function parseRfqTitle(message: string | undefined | null): string | undefined {
+  if (!message) return undefined;
+  const match = message.match(/^Title\s*:\s*(.+)$/im);
+  return match?.[1]?.trim();
+}
+
+/* ────────────────────────────────────────────────────────────────────────────
+ *  RFQ → PO mapping (batch)
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * For a list of RFQ names, resolve which ones have a linked Purchase Order
+ * and return a map of rfqName → poName.
+ *
+ * IMPORTANT — this ERPNext install rejects list queries on
+ * `Purchase Order Item.request_for_quotation` (HTTP 417 DataError).
+ * The RFQ link lives on **Supplier Quotation Item.request_for_quotation**;
+ * POs link via **Purchase Order Item.supplier_quotation**. We use that
+ * chain only (same as `getRFQNamesWithPO` / RFQ list).
+ */
+export async function batchRFQToPOMap(
+  rfqNames: string[]
+): Promise<Map<string, string>> {
+  const map = new Map<string, string>();
+  const unique = [...new Set(rfqNames.filter(Boolean))];
+  if (unique.length === 0) return map;
+
+  const t0 = typeof performance !== "undefined" ? performance.now() : 0;
+  // Dashboard counters only need a bounded sample.
+  const targets = unique.slice(0, 40);
+
+  await Promise.all(
+    targets.map(async (rfqName) => {
+      try {
+        // 1) Supplier Quotation names for this RFQ (permitted parent filter).
+        const sqRows = await apiGet<Array<{ name: string }>>(
+          buildResourceUrl("Supplier Quotation"),
+          {
+            params: {
+              fields: JSON.stringify(["name"]),
+              filters: JSON.stringify([
+                ["items.request_for_quotation", "=", rfqName],
+              ]),
+              limit_page_length: 50,
+            },
+          },
+        );
+        const sqNames = [
+          ...new Set((sqRows ?? []).map((r) => r.name).filter(Boolean)),
+        ];
+        if (sqNames.length === 0) return;
+
+        // 2) PO parent list filtered by child supplier_quotation (permitted).
+        const pos = await apiGet<Array<{ name: string }>>(
+          buildResourceUrl("Purchase Order"),
+          {
+            params: {
+              fields: JSON.stringify(["name"]),
+              filters: JSON.stringify([
+                ["Purchase Order Item", "supplier_quotation", "in", sqNames],
+              ]),
+              order_by: "creation desc",
+              limit_page_length: 1,
+            },
+          },
+        );
+        const poName = pos?.[0]?.name;
+        if (poName) map.set(rfqName, poName);
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error(
+          "[ERP failing request] batchRFQToPOMap",
+          { rfqName },
+          err instanceof Error ? err.message : err,
+        );
+      }
+    }),
+  );
+
+  // eslint-disable-next-line no-console
+  console.log(
+    LOG_TAG,
+    `batchRFQToPOMap: ${targets.length}/${unique.length} RFQs → ${map.size} POs` +
+      (t0 ? ` in ${Math.round(performance.now() - t0)}ms` : ""),
+    Object.fromEntries(map),
+  );
+  return map;
+}
+
+/* ────────────────────────────────────────────────────────────────────────────
+ *  Write operations
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+export async function updateReviewStatus(
+  rfqName: string,
+  status: LegalReviewStatus,
+  reviewedBy: string,
+  comment?: string
+): Promise<void> {
+  const now = nowERPDateTime();
+
+  let state = getApprovalState(rfqName);
+  if (!state) {
+    const erpMap = await fetchErpNextRFQs();
+    const row = erpMap.get(rfqName);
+    if (row) state = buildStateFromErpRfq(row);
+  }
+  if (!state) {
+    state = {
+      rfq: rfqName,
+      selected_supplier: "",
+      selected_supplier_total: 0,
+      workflow_step: "Pending Legal Review",
+      legal_status: "Pending Legal Review",
+      finance_status: "Pending Finance Review",
+      submitted_at: now,
+      submitted_by: reviewedBy,
+      legal_comments: [],
+      finance_comments: [],
+    };
+  }
+
+  state.legal_status = status;
+  state.legal_reviewer = reviewedBy;
+  state.legal_review_date = now;
+
+  if (status === "Approved") {
+    state.workflow_step = "Pending Finance Review";
+    state.finance_status = "Pending Finance Review";
+  } else if (status === "Rejected") {
+    state.workflow_step = "Legal Rejected";
+  }
+
+  if (comment?.trim()) {
+    state.legal_comments = [
+      ...(state.legal_comments ?? []),
+      {
+        comment: comment.trim(),
+        comment_by: reviewedBy,
+        comment_date: now,
+        action: status,
+      },
+    ];
+  }
+
+  await syncApprovalStateToErpNext(state);
+  saveApprovalState(state, { skipErpSync: true });
+}
+
+export function addComment(
+  rfqName: string,
+  comment: LegalComment
+): void {
+  const state = getApprovalState(rfqName);
+  if (!state) return;
+  state.legal_comments = [...(state.legal_comments ?? []), comment];
+  saveApprovalState(state);
+}
+
+export async function resubmitLegalReview(
+  rfqName: string,
+  resubmittedBy: string,
+  note?: string
+): Promise<void> {
+  // The Legal Document Review record — NOT the legacy RFQ custom-field
+  // workflow — is what Legal's queue and LegalReviewDetailPage actually
+  // read from. Resubmitting must update that same record, otherwise a
+  // legally-rejected RFQ never reappears in Legal's queue after Procurement
+  // "resubmits" it (see api/legalReviewCore.ts:resubmitLegalReview).
+  const legalDoc = await getLegalDocsByRfq(rfqName);
+  if (!legalDoc?.name) {
+    throw new Error(`No Legal Document Review found for RFQ ${rfqName}.`);
+  }
+  await resubmitLegalReviewApi(legalDoc.name, resubmittedBy, note);
+}
