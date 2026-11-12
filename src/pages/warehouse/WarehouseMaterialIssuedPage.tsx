@@ -1,0 +1,511 @@
+import { useState, useMemo, useEffect } from "react";
+import { useNavigate } from "react-router-dom";
+import { useQuery } from "@tanstack/react-query";
+import { CheckCircle, Download, Eye, Printer } from "lucide-react";
+import {
+  getIssuedMaterials,
+  getMaterialIssueDetail,
+  type MaterialIssueStatus,
+} from "../../services/warehouseService";
+import EmptyState from "../../components/EmptyState";
+import ErrorState from "../../components/ErrorState";
+import PageHeader from "../../components/PageHeader";
+import StatusBadge from "../../components/StatusBadge";
+import { TableSkeleton } from "../../components/Skeleton";
+import { SearchInput } from "../../components/ui";
+import { formatDate } from "../../utils/format";
+import {
+  downloadMaterialIssuePdf,
+  printMaterialIssuePdf,
+} from "../../utils/pdf/materialIssuePdf";
+import toast from "react-hot-toast";
+
+const PAGE_SIZE = 10;
+
+const STATUS_OPTIONS: Array<"" | MaterialIssueStatus> = [
+  "",
+  "Fully Issued",
+  "Partially Issued",
+  "Cancelled",
+];
+
+function IssueStatusBadge({ status }: { status: MaterialIssueStatus }) {
+  const label = status === "Fully Issued" ? "Completed" : status;
+  const tone =
+    status === "Fully Issued"
+      ? ("success" as const)
+      : status === "Partially Issued"
+        ? ("warning" as const)
+        : ("danger" as const);
+  return <StatusBadge status={label} tone={tone} />;
+}
+
+export default function WarehouseMaterialIssuedPage() {
+  const navigate = useNavigate();
+
+  const [search, setSearch] = useState("");
+  const [mrFilter, setMrFilter] = useState("");
+  const [deptFilter, setDeptFilter] = useState("");
+  const [warehouseFilter, setWarehouseFilter] = useState("");
+  const [statusFilter, setStatusFilter] = useState<"" | MaterialIssueStatus>("");
+  const [issuedByFilter, setIssuedByFilter] = useState("");
+  const [dateFrom, setDateFrom] = useState("");
+  const [dateTo, setDateTo] = useState("");
+  const [currentPage, setCurrentPage] = useState(1);
+
+  const issuedQuery = useQuery({
+    queryKey: ["warehouse", "issued", "logs"],
+    queryFn: () => getIssuedMaterials({ includeCancelled: true }),
+    retry: false,
+  });
+
+  const rows = useMemo(() => issuedQuery.data ?? [], [issuedQuery.data]);
+
+  const mrOptions = useMemo(
+    () =>
+      Array.from(new Set(rows.map((r) => r.mr_name).filter(Boolean))).sort(
+        (a, b) => a.localeCompare(b),
+      ),
+    [rows],
+  );
+  const deptOptions = useMemo(
+    () =>
+      Array.from(new Set(rows.map((r) => r.department).filter(Boolean))).sort(
+        (a, b) => a.localeCompare(b),
+      ),
+    [rows],
+  );
+  const warehouseOptions = useMemo(
+    () =>
+      Array.from(new Set(rows.map((r) => r.warehouse).filter(Boolean))).sort(
+        (a, b) => a.localeCompare(b),
+      ),
+    [rows],
+  );
+  const issuedByOptions = useMemo(
+    () =>
+      Array.from(new Set(rows.map((r) => r.issued_by).filter(Boolean))).sort(
+        (a, b) => a.localeCompare(b),
+      ),
+    [rows],
+  );
+
+  const filteredData = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return rows.filter((item) => {
+      if (mrFilter && item.mr_name !== mrFilter) return false;
+      if (deptFilter && item.department !== deptFilter) return false;
+      if (warehouseFilter && item.warehouse !== warehouseFilter) return false;
+      if (statusFilter && item.status !== statusFilter) return false;
+      if (issuedByFilter && item.issued_by !== issuedByFilter) return false;
+      if (dateFrom && item.issue_date && item.issue_date < dateFrom) return false;
+      if (dateTo && item.issue_date && item.issue_date > dateTo) return false;
+      if (q) {
+        const haystack = `${item.name} ${item.mr_name} ${item.department} ${item.issued_by} ${item.warehouse}`.toLowerCase();
+        if (!haystack.includes(q)) return false;
+      }
+      return true;
+    });
+  }, [
+    rows,
+    search,
+    mrFilter,
+    deptFilter,
+    warehouseFilter,
+    statusFilter,
+    issuedByFilter,
+    dateFrom,
+    dateTo,
+  ]);
+
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [
+    search,
+    mrFilter,
+    deptFilter,
+    warehouseFilter,
+    statusFilter,
+    issuedByFilter,
+    dateFrom,
+    dateTo,
+  ]);
+
+  const totalItems = filteredData.length;
+  const totalPages = Math.max(1, Math.ceil(totalItems / PAGE_SIZE));
+  const startIndex = (currentPage - 1) * PAGE_SIZE;
+  const paginatedData = useMemo(
+    () => filteredData.slice(startIndex, startIndex + PAGE_SIZE),
+    [filteredData, startIndex],
+  );
+
+  const filtersActive =
+    !!search ||
+    !!mrFilter ||
+    !!deptFilter ||
+    !!warehouseFilter ||
+    !!statusFilter ||
+    !!issuedByFilter ||
+    !!dateFrom ||
+    !!dateTo;
+
+  function clearFilters() {
+    setSearch("");
+    setMrFilter("");
+    setDeptFilter("");
+    setWarehouseFilter("");
+    setStatusFilter("");
+    setIssuedByFilter("");
+    setDateFrom("");
+    setDateTo("");
+  }
+
+  if (issuedQuery.isError) {
+    return (
+      <div className="w-full">
+        <div className="rounded-2xl border border-slate-100 bg-white p-8 shadow-sm">
+          <ErrorState
+            title="Unable to load Warehouse data."
+            description="We couldn't retrieve the issued materials log. Please try again."
+            onRetry={() => void issuedQuery.refetch()}
+          />
+        </div>
+      </div>
+    );
+  }
+
+  const runPdf = async (name: string, mode: "print" | "download") => {
+    try {
+      const detail = await getMaterialIssueDetail(name);
+      const payload = {
+        issue_number: detail.name,
+        mr_name: detail.mr_name,
+        department: detail.department,
+        warehouse: detail.warehouse,
+        issued_by: detail.issued_by,
+        receiver: detail.received_by || "—",
+        issue_date: detail.issue_date,
+        issue_type: detail.issue_type || "Full Issue",
+        remarks: detail.remarks,
+        items: detail.items.map((it) => ({
+          item_code: it.item_code,
+          item_name: it.item_name,
+          required_qty: it.requested_qty ?? 0,
+          issued_qty: it.issued_qty,
+          remaining_qty: it.remaining_qty ?? 0,
+          uom: it.uom,
+        })),
+      };
+      if (mode === "print") await printMaterialIssuePdf(payload);
+      else await downloadMaterialIssuePdf(payload);
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Unable to generate PDF.");
+    }
+  };
+
+  return (
+    <div className="flex w-full flex-col gap-6 duration-300 animate-in fade-in">
+      <PageHeader
+        title="Issued History"
+        description="Completed Material Issue records with print and PDF actions."
+      />
+
+      {/* Filters */}
+      <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+        <div className="mb-3">
+          <SearchInput
+            value={search}
+            onChange={setSearch}
+            placeholder="Search by issue number, MR, department, warehouse, or issued by…"
+          />
+        </div>
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
+          <FilterSelect
+            label="Material Request"
+            value={mrFilter}
+            onChange={setMrFilter}
+            options={mrOptions}
+            allLabel="All MRs"
+          />
+          <FilterSelect
+            label="Department"
+            value={deptFilter}
+            onChange={setDeptFilter}
+            options={deptOptions}
+            allLabel="All departments"
+          />
+          <FilterSelect
+            label="Warehouse"
+            value={warehouseFilter}
+            onChange={setWarehouseFilter}
+            options={warehouseOptions}
+            allLabel="All warehouses"
+          />
+          <FilterSelect
+            label="Issued By"
+            value={issuedByFilter}
+            onChange={setIssuedByFilter}
+            options={issuedByOptions}
+            allLabel="All users"
+          />
+          <div className="flex flex-col gap-1">
+            <label className="text-xs font-semibold text-slate-500">Status</label>
+            <select
+              value={statusFilter}
+              onChange={(e) =>
+                setStatusFilter(e.target.value as "" | MaterialIssueStatus)
+              }
+              className="select-field"
+            >
+              {STATUS_OPTIONS.map((opt) => (
+                <option key={opt} value={opt}>
+                  {opt || "All statuses"}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="flex flex-col gap-1">
+            <label className="text-xs font-semibold text-slate-500">
+              Date Range
+            </label>
+            <div className="flex items-center gap-1">
+              <input
+                type="date"
+                value={dateFrom}
+                onChange={(e) => setDateFrom(e.target.value)}
+                className="input-field"
+              />
+              <span className="text-xs text-slate-400">–</span>
+              <input
+                type="date"
+                value={dateTo}
+                onChange={(e) => setDateTo(e.target.value)}
+                className="input-field"
+              />
+            </div>
+          </div>
+        </div>
+        {filtersActive && (
+          <div className="mt-3 flex justify-end">
+            <button
+              type="button"
+              onClick={clearFilters}
+              className="text-xs font-semibold text-primary-600 hover:underline"
+            >
+              Clear filters
+            </button>
+          </div>
+        )}
+      </div>
+
+      {/* Table */}
+      <div className="flex min-h-[400px] flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
+        {issuedQuery.isLoading ? (
+          <div className="p-6">
+            <TableSkeleton rows={6} columns={7} />
+          </div>
+        ) : filteredData.length === 0 ? (
+          <div className="flex flex-1 items-center justify-center p-12">
+            <EmptyState
+              icon={CheckCircle}
+              title="No Issued Materials"
+              description={
+                filtersActive
+                  ? "Adjust your search or filters to see logs."
+                  : "No materials have been issued from the warehouse yet."
+              }
+            />
+          </div>
+        ) : (
+          <>
+            <div className="flex-1 overflow-x-auto">
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <th>Issue Number</th>
+                    <th>Material Request</th>
+                    <th>Department</th>
+                    <th>Warehouse</th>
+                    <th>Issued By</th>
+                    <th>Received By</th>
+                    <th className="text-right">Items</th>
+                    <th className="text-right">Qty</th>
+                    <th>Issue Date</th>
+                    <th>Issue Type</th>
+                    <th className="text-center">Status</th>
+                    <th className="text-center">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 text-sm">
+                  {paginatedData.map((row) => (
+                    <tr key={row.name} className="transition-colors hover:bg-slate-50/75">
+                      <td className="px-4 py-3.5">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            navigate(
+                              `/warehouse/material-requests/issued/${encodeURIComponent(row.name)}`,
+                            )
+                          }
+                          className="font-semibold text-primary-700 hover:underline"
+                        >
+                          {row.name}
+                        </button>
+                      </td>
+                      <td className="px-4 py-3.5">
+                        {row.mr_name ? (
+                          <span className="font-medium text-slate-800">
+                            {row.mr_name}
+                          </span>
+                        ) : (
+                          <span className="text-slate-400">—</span>
+                        )}
+                      </td>
+                      <td className="px-4 py-3.5 text-slate-600">
+                        {row.department || <span className="text-slate-400">—</span>}
+                      </td>
+                      <td className="px-4 py-3.5 text-slate-600">
+                        {row.warehouse || "—"}
+                      </td>
+                      <td className="px-4 py-3.5 text-slate-600">{row.issued_by}</td>
+                      <td className="px-4 py-3.5 text-slate-600">
+                        {row.received_by || "—"}
+                      </td>
+                      <td className="px-4 py-3.5 text-right tabular-nums">
+                        {row.total_items ?? "—"}
+                      </td>
+                      <td className="px-4 py-3.5 text-right tabular-nums">
+                        {row.total_quantity ?? "—"}
+                      </td>
+                      <td className="px-4 py-3.5 tabular-nums text-slate-600">
+                        {row.issue_date ? formatDate(row.issue_date, "dd MMM yyyy") : "—"}
+                      </td>
+                      <td className="px-4 py-3.5">
+                        <span
+                          className={`inline-flex rounded-full border px-2 py-0.5 text-[11px] font-semibold ${
+                            row.issue_type === "Partial Issue"
+                              ? "border-amber-200 bg-amber-50 text-amber-700"
+                              : "border-emerald-200 bg-emerald-50 text-emerald-700"
+                          }`}
+                        >
+                          {row.issue_type === "Partial Issue" ? "Partial" : "Full"}
+                        </span>
+                      </td>
+                      <td className="px-4 py-3.5 text-center">
+                        <IssueStatusBadge
+                          status={
+                            (row.status === "Fully Issued"
+                              ? "Fully Issued"
+                              : row.status) as MaterialIssueStatus
+                          }
+                        />
+                      </td>
+                      <td className="px-4 py-3.5">
+                        <div className="flex items-center justify-center gap-1">
+                          <button
+                            type="button"
+                            title="View"
+                            onClick={() =>
+                              navigate(
+                                `/warehouse/material-requests/issued/${encodeURIComponent(row.name)}`,
+                              )
+                            }
+                            className="inline-flex items-center justify-center rounded-md border border-slate-200 bg-white p-1.5 text-slate-500 hover:border-primary-200 hover:bg-primary-50 hover:text-primary-700"
+                          >
+                            <Eye className="h-4 w-4" />
+                          </button>
+                          <button
+                            type="button"
+                            title="Download PDF"
+                            onClick={() => void runPdf(row.name, "download")}
+                            className="inline-flex items-center justify-center rounded-md border border-slate-200 bg-white p-1.5 text-slate-500 hover:border-primary-200 hover:bg-primary-50 hover:text-primary-700"
+                          >
+                            <Download className="h-4 w-4" />
+                          </button>
+                          <button
+                            type="button"
+                            title="Print"
+                            onClick={() => void runPdf(row.name, "print")}
+                            className="inline-flex items-center justify-center rounded-md border border-slate-200 bg-white p-1.5 text-slate-500 hover:border-primary-200 hover:bg-primary-50 hover:text-primary-700"
+                          >
+                            <Printer className="h-4 w-4" />
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            {totalPages > 1 && (
+              <div className="flex items-center justify-between border-t border-slate-200 bg-slate-50 px-6 py-4">
+                <span className="text-xs text-slate-500">
+                  Showing{" "}
+                  <span className="font-semibold text-slate-800">
+                    {startIndex + 1}
+                  </span>{" "}
+                  to{" "}
+                  <span className="font-semibold text-slate-800">
+                    {Math.min(startIndex + PAGE_SIZE, totalItems)}
+                  </span>{" "}
+                  of{" "}
+                  <span className="font-semibold text-slate-800">{totalItems}</span>{" "}
+                  logs
+                </span>
+                <div className="flex gap-2">
+                  <button
+                    disabled={currentPage === 1}
+                    onClick={() => setCurrentPage((p) => p - 1)}
+                    className="rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 transition hover:bg-slate-50 disabled:opacity-50"
+                  >
+                    Previous
+                  </button>
+                  <button
+                    disabled={currentPage === totalPages}
+                    onClick={() => setCurrentPage((p) => p + 1)}
+                    className="rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 transition hover:bg-slate-50 disabled:opacity-50"
+                  >
+                    Next
+                  </button>
+                </div>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function FilterSelect({
+  label,
+  value,
+  onChange,
+  options,
+  allLabel,
+}: {
+  label: string;
+  value: string;
+  onChange: (v: string) => void;
+  options: string[];
+  allLabel: string;
+}) {
+  return (
+    <div className="flex flex-col gap-1">
+      <label className="text-xs font-semibold text-slate-500">{label}</label>
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="select-field"
+      >
+        <option value="">{allLabel}</option>
+        {options.map((opt) => (
+          <option key={opt} value={opt}>
+            {opt}
+          </option>
+        ))}
+      </select>
+    </div>
+  );
+}

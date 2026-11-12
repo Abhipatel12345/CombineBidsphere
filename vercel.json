@@ -1,0 +1,120 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
+  "crons": [{ "path": "/api/clm-monitor", "schedule": "0 3 * * *" }],
+
+  "rewrites": [
+    {
+      "source": "/api/clm-monitor",
+      "destination": "/api/clm-monitor"
+    },
+    {
+      "source": "/api/clm",
+      "destination": "/api/clm"
+    },
+    {
+      "source": "/api/auth/:action",
+      "destination": "/api/auth-login?action=:action"
+    },
+    {
+      "source": "/api/legal-review/(.*)",
+      "destination": "/api/legal-review?action=$1"
+    },
+    {
+      "source": "/api/bom/(.*)",
+      "destination": "/api/bom?action=$1"
+    },
+    {
+      "source": "/api/supplier-onboarding/(.*)",
+      "destination": "/api/supplier-onboarding?action=$1"
+    },
+    {
+      "source": "/api/po-shipment/(.*)",
+      "destination": "/api/po-shipment?action=$1"
+    },
+    {
+      "source": "/api/supplier-voucher/(.*)",
+      "destination": "/api/supplier-voucher?action=$1"
+    },
+    {
+      "source": "/api/supplier-rfq-documents",
+      "destination": "/api/supplier-rfq-documents"
+    },
+    {
+      "source": "/api/stock-check",
+      "destination": "/api/stock-check"
+    },
+    {
+      "source": "/api/create-rfq-from-pr",
+      "destination": "/api/create-rfq-from-pr"
+    },
+    {
+      "source": "/api/create-rfq-from-ecr",
+      "destination": "/api/create-rfq-from-ecr"
+    },
+    {
+      "source": "/api/create-pr-from-ecr",
+      "destination": "/api/create-pr-from-ecr"
+    },
+    {
+      "source": "/api/ecr-workflow-action",
+      "destination": "/api/ecr-workflow-action"
+    },
+    {
+      "source": "/api/ecr-create",
+      "destination": "/api/ecr-create"
+    },
+    {
+      "source": "/api/rfq-supplier-invite",
+      "destination": "/api/rfq-supplier-invite"
+    },
+    {
+      "source": "/api/rfq-quote-round",
+      "destination": "/api/rfq-quote-round"
+    },
+    {
+      "source": "/api/recommend-suppliers",
+      "destination": "/api/recommend-suppliers"
+    },
+    {
+      "source": "/api/reverse-bidding-naming",
+      "destination": "/api/reverse-bidding-naming"
+    },
+    {
+      "source": "/api/reverse-bidding-submit-item-bids",
+      "destination": "/api/reverse-bidding-submit-item-bids"
+    },
+    {
+      "source": "/api/file-proxy",
+      "destination": "/api/file-proxy"
+    },
+    {
+      "source": "/api/file-link-copy",
+      "destination": "/api/file-link-copy"
+    },
+    {
+      "source": "/api/erp-server-date",
+      "destination": "/api/erp-server-date"
+    },
+    {
+      "source": "/api/business-cases/:caseId/attachments/:path*",
+      "destination": "/api/business-cases-attachment?caseId=:caseId&path=:path*"
+    },
+    {
+      "source": "/api/(.*)",
+      "destination": "/api/proxy?path=$1"
+    },
+    {
+      "source": "/((?!api/).*)",
+      "destination": "/index.html"
+    }
+  ],
+
+  "functions": {
+    "api/*.ts": {
+      "maxDuration": 30,
+      "includeFiles": "public/{netlink-logo-transparent.png,fonts/Roboto-Regular.ttf}"
+    }
+  }
+}

@@ -1,0 +1,228 @@
+import { lazy, Suspense, useMemo } from "react";
+import { useQuery } from "@tanstack/react-query";
+
+import {
+  fetchDashboardAnalytics,
+  fetchDashboardCounts,
+} from "../../api/dashboard";
+import { getApprovedRFQsAwaitingPO } from "../../api/purchasing";
+import type { AppRole } from "../../config/roles";
+import {
+  filterActivityByRole,
+  getDashboardConfig,
+  getExecutiveDashboardLayout,
+} from "../../config/dashboardRoles";
+import ActionCenter from "./ActionCenter";
+import AdminKpiRow from "./AdminKpiRow";
+import ProcurementAnalyticsSection from "./ProcurementAnalyticsSection";
+import AlertsRisksPanel from "./AlertsRisksPanel";
+import CompactActivityFeed from "./CompactActivityFeed";
+import DashboardHeader from "./DashboardHeader";
+import SavingsOpportunitiesPanel from "./SavingsOpportunitiesPanel";
+import TopSuppliersPanel from "./TopSuppliersPanel";
+import SlaCountdownWidget from "../sla/SlaCountdownWidget";
+import { Skeleton } from "../Skeleton";
+import {
+  buildActivityFeed,
+  buildAlertsAndRisks,
+  buildSupplierInsights,
+  buildTopSuppliersWithTrend,
+  computeExecutiveKpis,
+  computeMonthlySpendTrend,
+  computeSavingsOpportunities,
+  computeShipmentMetrics,
+  computeSupplierConcentration,
+  ensureTopSuppliersBySpend,
+} from "../../utils/dashboardUtils";
+
+const AdminSpendCharts = lazy(() => import("./AdminSpendCharts"));
+
+interface Props {
+  role: Exclude<AppRole, "warehouse" | "legal" | "department" | "manufacturing">;
+  greetingName: string;
+}
+
+export default function AdminDashboard({ role, greetingName }: Props) {
+  const dashboardConfig = getDashboardConfig(role);
+  const layout = getExecutiveDashboardLayout(role);
+
+  const countsQuery = useQuery({
+    queryKey: ["dashboard-counts"],
+    queryFn: fetchDashboardCounts,
+    staleTime: 5 * 60_000,
+    retry: false,
+  });
+
+  const analyticsQuery = useQuery({
+    queryKey: ["dashboard-analytics"],
+    queryFn: fetchDashboardAnalytics,
+    staleTime: 5 * 60_000,
+    retry: false,
+  });
+
+  const counts = countsQuery.data ?? null;
+  const analytics = analyticsQuery.data;
+  const loading = countsQuery.isLoading || analyticsQuery.isLoading;
+
+  const kpis = useMemo(() => {
+    if (!analytics || !counts) return null;
+    return computeExecutiveKpis({ ...analytics, counts });
+  }, [analytics, counts]);
+
+  const monthlySpend = useMemo(
+    () => computeMonthlySpendTrend(analytics?.invoices ?? []),
+    [analytics?.invoices]
+  );
+
+  const topSuppliers = useMemo(
+    () =>
+      ensureTopSuppliersBySpend(
+        analytics?.invoices ?? [],
+        analytics?.poSamples ?? [],
+        5
+      ),
+    [analytics?.invoices, analytics?.poSamples]
+  );
+
+  const concentration = useMemo(
+    () => computeSupplierConcentration(topSuppliers),
+    [topSuppliers]
+  );
+
+  const topSuppliersTrend = useMemo(
+    () =>
+      buildTopSuppliersWithTrend(
+        analytics?.invoices ?? [],
+        analytics?.poSamples ?? [],
+        5
+      ),
+    [analytics?.invoices, analytics?.poSamples]
+  );
+
+  const supplierInsights = useMemo(
+    () => buildSupplierInsights(topSuppliers),
+    [topSuppliers]
+  );
+
+  const shipmentMetrics = useMemo(
+    () =>
+      computeShipmentMetrics(
+        analytics?.poSamples ?? [],
+        analytics?.upcomingDeliveries ?? []
+      ),
+    [analytics?.poSamples, analytics?.upcomingDeliveries]
+  );
+
+  const activityFeed = useMemo(() => {
+    if (!analytics) return [];
+    const items = buildActivityFeed(
+      analytics.recentRfqs,
+      analytics.recentPos,
+      analytics.recentInvoices,
+      analytics.recentPayments ?? []
+    );
+    return filterActivityByRole(items, role);
+  }, [analytics, role]);
+
+  const savings = useMemo(
+    () => computeSavingsOpportunities(kpis?.ytdSpend ?? 0),
+    [kpis?.ytdSpend]
+  );
+
+  const alerts = useMemo(
+    () =>
+      counts
+        ? buildAlertsAndRisks(
+            counts,
+            shipmentMetrics,
+            supplierInsights,
+            concentration
+          )
+        : [],
+    [counts, shipmentMetrics, supplierInsights, concentration]
+  );
+
+  const panelCount =
+    Number(layout.showTopSuppliers) +
+    Number(layout.showSavings) +
+    Number(layout.showAlerts);
+
+  const readyForPOQuery = useQuery({
+    queryKey: ["po-queue-ready-rfqs"],
+    queryFn: getApprovedRFQsAwaitingPO,
+    staleTime: 60_000,
+    retry: false,
+  });
+  const readyForPOCount = readyForPOQuery.data?.length ?? 0;
+
+  return (
+    <div className="dashboard-stack">
+      <DashboardHeader config={dashboardConfig} greetingName={greetingName} />
+
+      <ActionCenter actions={layout.quickActions} />
+
+      <AdminKpiRow
+        kpis={kpis}
+        counts={counts}
+        kpiKeys={layout.kpiKeys}
+        loading={countsQuery.isLoading}
+        readyForPOCount={readyForPOCount}
+      />
+
+      <ProcurementAnalyticsSection
+        title="Enterprise Analytics"
+        subtitle="Budget & savings overview"
+        kpis={["budgetUtilisation", "costSavings"]}
+        charts={["budgetVsActual", "costSavings"]}
+      />
+
+      <SlaCountdownWidget role="admin" title="Admin SLA Countdown" />
+
+      {layout.showSpendCharts ? (
+        <Suspense
+          fallback={
+            <div className="dashboard-grid-2">
+              <Skeleton className="min-h-[280px] rounded-card" />
+              <Skeleton className="min-h-[280px] rounded-card" />
+            </div>
+          }
+        >
+          <AdminSpendCharts monthlySpend={monthlySpend} loading={loading} />
+        </Suspense>
+      ) : null}
+
+      {layout.showActivity ? (
+        <CompactActivityFeed
+          items={activityFeed}
+          loading={analyticsQuery.isLoading}
+          title={layout.activityTitle}
+        />
+      ) : null}
+
+      {panelCount > 0 ? (
+        <div
+          className={
+            panelCount >= 3
+              ? "dashboard-grid-3"
+              : panelCount === 2
+                ? "dashboard-grid-2"
+                : "grid w-full grid-cols-1 gap-6"
+          }
+        >
+          {layout.showTopSuppliers ? (
+            <TopSuppliersPanel
+              rows={topSuppliersTrend}
+              loading={analyticsQuery.isLoading}
+            />
+          ) : null}
+          {layout.showSavings ? (
+            <SavingsOpportunitiesPanel items={savings} loading={loading} />
+          ) : null}
+          {layout.showAlerts ? (
+            <AlertsRisksPanel items={alerts} loading={countsQuery.isLoading} />
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}

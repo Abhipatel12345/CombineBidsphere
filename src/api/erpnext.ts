@@ -1,0 +1,1511 @@
+import axios, { AxiosError } from "axios";
+import type {
+  AxiosRequestConfig,
+  AxiosResponse,
+  InternalAxiosRequestConfig,
+} from "axios";
+import toast from "react-hot-toast";
+
+import { handleSessionExpired } from "../store/sessionExpiry";
+import { readErpProxyAccessToken } from "../utils/accessToken";
+import {
+  isRetryableNetworkError,
+  logFailedApiRequest,
+  MAX_NETWORK_RETRIES,
+  sleep,
+} from "../utils/apiReliability";
+
+import { COMPANY_NAME } from "../config/branding";
+
+export const ENV_DEFAULTS = {
+  company: (import.meta.env.VITE_BIDSPHERE_COMPANY_NAME as string | undefined) ?? "",
+};
+
+/**
+ * Company used on every ERPNext write. Prefer `VITE_BIDSPHERE_COMPANY_NAME` at build time;
+ * fall back to the branded Netlink company — never a stale "Inteva" default
+ * (that company has no warehouses on this site, so stock-item MRs fail with
+ * "Warehouse is mandatory for stock Item …").
+ */
+export const COMPANY = ENV_DEFAULTS.company.trim() || COMPANY_NAME;
+
+/**
+ * Same-origin `/api/*` requests — proxied to ERPNext in every environment:
+ *
+ * - **Development:** Vite dev server proxy (`vite.config.ts` → `VITE_BIDSPHERE_ERP_URL`)
+ * - **Production (Vercel):** Serverless proxy (`api/proxy.ts` → `BIDSPHERE_ERP_URL`)
+ *
+ * Upstream ERPNext auth: API-key (`Authorization: token key:secret`).
+ * SPA principal: `X-Bidsphere-Access-Token` (attached per request from
+ * session storage — required for payables mutations / production proxy).
+ * `withCredentials` is intentionally false so the browser never sends or
+ * stores ERPNext session cookies (`sid`, `csrf_token`, …). Those cookies are
+ * host-scoped (not port-scoped); sharing them with ERP Desk on the same host
+ * would invalidate Desk after SPA login.
+ */
+export const erpnextClient = axios.create({
+  baseURL: "",
+  timeout: 15000,
+  withCredentials: true,
+  headers: {
+    "Content-Type": "application/json",
+  },
+});
+
+export const erpnext = erpnextClient;
+
+/**
+ * Reusable helper to read CSRF token from browser cookies.
+ */
+export const getCsrfToken = (): string => {
+  if (typeof document === "undefined") return "";
+  const match = document.cookie.match(/(?:^|;\s*)csrf_token=([^;]+)/);
+  return match ? decodeURIComponent(match[1]) : "";
+};
+
+/**
+ * Reusable helper to build headers with CSRF token for Frappe mutation requests.
+ */
+export const getAuthHeaders = (): Record<string, string> => {
+  const csrf = getCsrfToken();
+  return {
+    "Content-Type": "application/json",
+    ...(csrf ? { "X-Frappe-CSRF-Token": csrf } : {}),
+  };
+};
+
+/**
+ * Reusable helper to extract detailed API error messages from ERPNext responses.
+ */
+export const getApiErrorMessage = (err: any): string => {
+  let serverMsg = "";
+  if (err?.response?.data?._server_messages) {
+    try {
+      const parsed = JSON.parse(err.response.data._server_messages);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        const inner =
+          typeof parsed[0] === "string" && parsed[0].startsWith("{")
+            ? JSON.parse(parsed[0])
+            : null;
+        serverMsg = inner?.message || parsed[0];
+      }
+    } catch {
+      serverMsg = String(err.response.data._server_messages);
+    }
+  }
+
+  return (
+    err?.response?.data?.exception ||
+    serverMsg ||
+    err?.response?.data?.message ||
+    err?.response?.data?.exc ||
+    err?.response?.data?.exc_type ||
+    err?.message ||
+    "Unknown ERPNext error"
+  );
+};
+
+type RetryableAxiosConfig = InternalAxiosRequestConfig & {
+  __retryCount?: number;
+  _disableNetworkRetry?: boolean;
+};
+
+/**
+ * Per-request escape hatch: pass `{ _silent: true }` in the axios config to
+ * skip the global error toast (the rejected promise is still propagated).
+ *
+ * Useful for the connection-status heartbeat ping, which already renders
+ * its own banner and shouldn't double-up with toasts.
+ */
+export interface SilentRequestConfig {
+  _silent?: boolean;
+  /** Return the raw axios response body (used by login/logout). */
+  _preserveResponse?: boolean;
+  /** Disable the shared network retry loop for explicitly controlled writes. */
+  _disableNetworkRetry?: boolean;
+}
+
+/** Merge `_silent: true` so callers handle toasts locally (avoids duplicates). */
+export function withSilent(
+  config?: AxiosRequestConfig
+): AxiosRequestConfig & SilentRequestConfig {
+  return { ...config, _silent: true };
+}
+
+/** Defense in depth for writes whose replay policy is owned by their endpoint. */
+export function withoutNetworkRetry(
+  config?: AxiosRequestConfig,
+): AxiosRequestConfig & SilentRequestConfig {
+  return { ...config, _disableNetworkRetry: true };
+}
+
+erpnext.interceptors.request.use(
+  (config: InternalAxiosRequestConfig) => {
+    const method = config.method?.toLowerCase();
+    const url = `${config.baseURL ?? ""}${config.url ?? ""}`;
+
+    if (
+      url.includes("Custom Field") &&
+      method &&
+      ["post", "put", "patch", "delete"].includes(method)
+    ) {
+      // eslint-disable-next-line no-console
+      console.error(
+        "[BLOCKED] Attempted to create/modify a Custom Field from the frontend.",
+        "This causes duplicate-field and deadlock errors.",
+        "Custom fields must be created manually in ERPNext, not from the app.",
+        { method, url }
+      );
+      const blocked = new Error(
+        "Custom Field creation from frontend is disabled"
+      ) as AxiosError & SilentRequestConfig;
+      blocked._silent = true;
+      return Promise.reject(blocked);
+    }
+
+    // eslint-disable-next-line no-console
+    if (import.meta.env.DEV) console.log("REQUEST", config.method, url);
+
+    // Extract and print DocType before query for audit purposes
+    let loggedDocType: string | null = null;
+    if (url.includes("/api/resource/")) {
+      const match = url.match(/\/api\/resource\/([^/?#]+)/);
+      if (match && match[1]) {
+        loggedDocType = decodeURIComponent(match[1]);
+      }
+    } else if (
+      url.includes("frappe.client.get_list") ||
+      url.includes("frappe.client.get") ||
+      url.includes("frappe.client.save") ||
+      url.includes("frappe.client.submit") ||
+      url.includes("frappe.client.cancel")
+    ) {
+      let bodyData: any = null;
+      if (typeof config.data === "string") {
+        try {
+          bodyData = JSON.parse(config.data);
+        } catch {}
+      } else if (config.data && typeof config.data === "object") {
+        bodyData = config.data;
+      }
+      loggedDocType =
+        bodyData?.doctype ||
+        bodyData?.doc?.doctype ||
+        config.params?.doctype ||
+        null;
+    }
+
+    if (loggedDocType) {
+      // eslint-disable-next-line no-console
+      console.log(`Querying ${loggedDocType}...`);
+    }
+
+    // SPA auth endpoints are handled by our server (`/api/auth/*`), not by
+    // Frappe session login. Strip token auth — the server validates passwords.
+    const urlPath = (config.url ?? "").split("?")[0];
+    const isAuthEndpoint =
+      urlPath === "/api/auth/login" ||
+      urlPath === "/api/auth/logout" ||
+      // Legacy paths — blocked by proxy; never send credentials either.
+      urlPath === "/api/method/login" ||
+      urlPath === "/api/method/logout";
+    if (isAuthEndpoint) {
+      config.headers.delete("Authorization");
+      config.withCredentials = false;
+    } else {
+      // BidSphere RBAC principal (HMAC from staff login or supplier portal).
+      // ERPNext upstream still uses Authorization: token key:secret.
+      // Do NOT use sid cookies / withCredentials — Desk session collision.
+      // Without this header, payables mutations (Voucher / PI / PE) hit
+      // requireAnyAuth → 401 → handleSessionExpired → /login.
+      const accessToken = readErpProxyAccessToken();
+      if (accessToken) {
+        if (typeof config.headers?.set === "function") {
+          config.headers.set("X-Bidsphere-Access-Token", accessToken);
+        } else if (config.headers) {
+          (config.headers as Record<string, unknown>)[
+            "X-Bidsphere-Access-Token"
+          ] = accessToken;
+        }
+      }
+    }
+
+    // Do NOT read csrf_token from document.cookie. On a shared host that
+    // cookie belongs to ERP Desk; attaching it here couples the SPA to Desk
+    // and can break Desk CSRF after SPA traffic. API-key auth does not need it.
+
+    // FormData / multipart: the axios instance defaults to application/json.
+    // That default (or a bare multipart/form-data without boundary) makes
+    // Frappe's upload_file return HTTP 417 — MandatoryError: file_name/file_url.
+    // Delete Content-Type so the runtime sets multipart/form-data; boundary=…
+    if (typeof FormData !== "undefined" && config.data instanceof FormData) {
+      if (typeof config.headers?.delete === "function") {
+        config.headers.delete("Content-Type");
+        config.headers.delete("content-type");
+      } else if (config.headers) {
+        delete (config.headers as Record<string, unknown>)["Content-Type"];
+        delete (config.headers as Record<string, unknown>)["content-type"];
+      }
+    }
+
+    const isMutation =
+      method === "post" ||
+      method === "put" ||
+      method === "delete" ||
+      method === "patch";
+
+    // Dev-only: log mutating requests with full URL + payload so we can
+    // reproduce 400s with the exact payload ERPNext actually saw.
+    if (import.meta.env.DEV && isMutation && method) {
+      let parsed: unknown = config.data;
+      if (typeof FormData !== "undefined" && config.data instanceof FormData) {
+        parsed = "(FormData multipart — Content-Type left for boundary)";
+      } else if (typeof config.data === "string") {
+        try {
+          parsed = JSON.parse(config.data);
+        } catch {
+          /* not JSON — log as-is */
+        }
+      }
+      const fullUrl = `${config.baseURL ?? ""}${config.url ?? ""}`;
+      // eslint-disable-next-line no-console
+      console.log(
+        `[ERPNext → ${method.toUpperCase()}] ${fullUrl}`,
+        "\nPayload:",
+        parsed ?? "(no body)"
+      );
+    }
+    return config;
+  },
+  (error: AxiosError) => Promise.reject(error)
+);
+
+erpnext.interceptors.response.use(
+  (response: AxiosResponse) => {
+    if (import.meta.env.DEV) {
+      // eslint-disable-next-line no-console
+      console.log("RESPONSE", response.status, response.config.url);
+    }
+
+    const preserve =
+      (response.config as SilentRequestConfig | undefined)?._preserveResponse ===
+      true;
+    if (preserve) {
+      return response;
+    }
+
+    const payload = response.data;
+
+    // Dev-only: pair every mutating request log with its response body
+    // so the success path is just as easy to inspect as the failure path.
+    if (
+      import.meta.env.DEV &&
+      response.config?.method &&
+      ["post", "put", "delete"].includes(
+        response.config.method.toLowerCase()
+      )
+    ) {
+      const fullUrl = `${response.config.baseURL ?? ""}${
+        response.config.url ?? ""
+      }`;
+      // eslint-disable-next-line no-console
+      console.log(
+        `[ERPNext ← ${response.config.method.toUpperCase()}] ${fullUrl} → ${
+          response.status
+        }`,
+        "\nResponse:",
+        payload ?? "(no body)"
+      );
+    }
+
+    if (payload && typeof payload === "object") {
+      if ("message" in payload && payload.message !== undefined) {
+        return payload.message;
+      }
+      if ("data" in payload && payload.data !== undefined) {
+        return payload.data;
+      }
+    }
+
+    return payload;
+  },
+  async (error: AxiosError<ErpNextErrorPayload>) => {
+    const config = error.config as RetryableAxiosConfig | undefined;
+
+    if (config && !config._disableNetworkRetry && isRetryableNetworkError(error)) {
+      const attempt = config.__retryCount ?? 0;
+      if (attempt < MAX_NETWORK_RETRIES) {
+        config.__retryCount = attempt + 1;
+        // eslint-disable-next-line no-console
+        console.warn("[API Retry]", {
+          url: `${config.baseURL ?? ""}${config.url ?? ""}`,
+          attempt: config.__retryCount,
+          max: MAX_NETWORK_RETRIES,
+          reason: error.code ?? error.message,
+        });
+        await sleep(1000 * config.__retryCount);
+        return erpnext(config);
+      }
+    }
+
+    const silentFromConfig =
+      (error.config as (typeof error.config & SilentRequestConfig) | undefined)
+        ?._silent === true;
+    const silentFromError =
+      (error as AxiosError & SilentRequestConfig)._silent === true;
+
+    if (import.meta.env.DEV) {
+      // eslint-disable-next-line no-console
+      console.error(
+        "AXIOS ERROR",
+        error.response?.status,
+        error.config?.url,
+        error.message
+      );
+    }
+
+    const status = error.response?.status;
+    const data = error.response?.data;
+
+    const errPath = (error.config?.url ?? "").split("?")[0];
+    const isAuthEndpoint =
+      errPath === "/api/auth/login" ||
+      errPath === "/api/auth/logout" ||
+      errPath === "/api/method/login" ||
+      errPath === "/api/method/logout";
+    if (status === 401 && !isAuthEndpoint && !silentFromConfig && !silentFromError) {
+      handleSessionExpired();
+    }
+
+    // Best-effort parse of the outbound payload so the log shows the
+    // exact JSON object axios sent (axios serialises body data to a
+    // JSON string before the request goes out).
+    let requestData: unknown = error.config?.data;
+    if (typeof requestData === "string") {
+      try {
+        requestData = JSON.parse(requestData);
+      } catch {
+        /* not JSON — keep the raw string */
+      }
+    }
+
+    // ─── 403 Permission denied ─────────────────────────────────────────
+    if (status === 403) {
+      const docInfo = extractDocNameFromUrl(error.config?.url);
+      const serverDetail = extractErpNextError(data);
+      const excLine = data?.exc ? parseExc(data.exc) : null;
+      const rawMsg =
+        typeof data?.message === "string" && data.message
+          ? data.message
+          : undefined;
+
+      // eslint-disable-next-line no-console
+      console.error("[403 Permission Error]", {
+        url: error.config?.url,
+        method: error.config?.method,
+        doctype: docInfo?.doctype,
+        document: docInfo?.name,
+        requestData,
+        serverMessage: rawMsg,
+        serverMessages: serverDetail,
+        excLine,
+        exc_type: data?.exc_type,
+        exc: data?.exc,
+        fullResponse: data,
+      });
+
+      const parts: string[] = [];
+      if (docInfo) {
+        parts.push(`Permission denied for ${docInfo.doctype}${docInfo.name ? ` "${docInfo.name}"` : ""}.`);
+      }
+      if (serverDetail) parts.push(serverDetail);
+      else if (excLine) parts.push(excLine);
+      else if (rawMsg && rawMsg !== "Insufficient Permission") parts.push(rawMsg);
+
+      const msg = parts.length > 0
+        ? parts.join(" ")
+        : `Insufficient permissions for ${error.config?.method?.toUpperCase() ?? "request"} ${error.config?.url ?? ""}. Check that the API user has Create/Write/Submit rights on the relevant DocType.`;
+
+      error.message = msg;
+      return Promise.reject(error);
+    }
+
+    // ─── Full structured log ───────────────────────────────────────────
+    // Always log the complete Frappe payload (HTTP 417 ValidationError etc.).
+    const parsedValidation = extractErpNextError(data);
+    // eslint-disable-next-line no-console
+    console.error("[ERPNext Full Error]", {
+      status,
+      url: error.config?.url,
+      method: error.config?.method,
+      requestData,
+      responseData: data,
+      completeResponse: data,
+      exc: data?.exc,
+      exc_type: data?.exc_type,
+      exception: data?.exception,
+      server_messages: data?._server_messages,
+      message: data?.message,
+      parsedValidation,
+    });
+    if (
+      typeof error.config?.url === "string" &&
+      /frappe\.client\.(save|submit|insert)/i.test(error.config.url)
+    ) {
+      // eslint-disable-next-line no-console
+      console.error("[frappe.client.save] non-200 response — complete body", {
+        status,
+        url: error.config.url,
+        _server_messages: data?._server_messages,
+        exc: data?.exc,
+        exception: data?.exception,
+        message: data?.message,
+        exc_type: data?.exc_type,
+        parsedValidation,
+        completeResponse: data,
+      });
+    }
+
+    // ─── Message cascade (most informative → least) ────────────────────
+    // Prefer real ERPNext validation text — never collapse to a generic toast.
+    let message = "Request failed";
+    // CSRFTokenError on token-auth POSTs surfaces as a generic "Invalid
+    // Request" via `_server_messages`; promote it to a clearer label so
+    // the toast and console reflect the actual cause.
+    if (data?.exc_type === "CSRFTokenError") {
+      message =
+        "CSRFTokenError: missing or invalid X-Frappe-CSRF-Token header.";
+    } else if (data?.exc_type === "DoesNotExistError" || status === 404) {
+      const docName = extractDocNameFromUrl(error.config?.url);
+      // Prefer the ERPNext exception text — child-table naming failures often
+      // surface as DoesNotExistError while the parent URL still exists.
+      const serverMsg = parsedValidation;
+      message =
+        (serverMsg && /does not exist|not found|Please set the document name/i.test(serverMsg)
+          ? serverMsg
+          : null) ||
+        (docName
+          ? `${docName.doctype} "${docName.name}" does not exist in ERPNext.`
+          : "The requested document does not exist.");
+      // eslint-disable-next-line no-console
+      console.warn("[DoesNotExistError]", {
+        url: error.config?.url,
+        doctype: docName?.doctype,
+        document: docName?.name,
+        serverMessage: serverMsg || null,
+        resolvedMessage: message,
+      });
+      error.message = cleanErpValidationMessage(String(message));
+      (error as AxiosError & { _isDocNotFound: boolean })._isDocNotFound = true;
+      return Promise.reject(error);
+    } else if (data?.exc_type === "LinkValidationError") {
+      message =
+        friendlyLinkValidationMessage(data) ??
+        parsedValidation ??
+        "A linked record is missing. Please check your selections.";
+    } else if (data?.exc_type === "MandatoryError") {
+      message =
+        friendlyMandatoryErrorMessage(data) ??
+        parsedValidation ??
+        "Please fill in all required fields.";
+    } else if (data?.exc_type === "UpdateAfterSubmitError") {
+      const serverMsg = String(parsedValidation || data.message || error.message || "");
+      // Never surface raw ERPNext UpdateAfterSubmitError text in the UI.
+      message =
+        /warehouse\s*e-?sign|warehouse_/i.test(serverMsg)
+          ? "The GRN has already been finalized."
+          : "This document has already been submitted and cannot be changed.";
+    } else if (parsedValidation) {
+      // ValidationError (often HTTP 417) and any other Frappe business error.
+      message = parsedValidation;
+    } else if (typeof data?.error === "string" && data.error) {
+      message = data.error;
+    } else if (data?.exception) {
+      message = String(data.exception);
+    } else if (typeof data?.message === "string" && data.message) {
+      message = data.message;
+    } else if (error.message) {
+      message = error.message;
+    }
+
+    message = cleanErpValidationMessage(String(message));
+    if (data?.field_errors && typeof data.field_errors === "object") {
+      (error as AxiosError & { fieldErrors?: Record<string, string> }).fieldErrors =
+        data.field_errors;
+    }
+
+    // Keep the friendly mapping for connection-level errors (timeout /
+    // 502 / 503 / 504 / network) so users see actionable hints instead
+    // of "Request failed" when ERPNext is simply offline.
+    const connectionFriendly = friendlyErrorMessage(error);
+    const isConnectionIssue =
+      error.code === "ECONNABORTED" ||
+      error.code === "ERR_NETWORK" ||
+      error.message === "Network Error" ||
+      status === 502 ||
+      status === 503 ||
+      status === 504;
+    const toastMessage =
+      isConnectionIssue && connectionFriendly
+        ? connectionFriendly
+        : message;
+
+    const isSchemaNoise =
+      data?.exc_type === "QueryDeadlockError" ||
+      /QueryDeadlockError/i.test(message) ||
+      /already exists in the/i.test(message) ||
+      error.message === "Custom Field creation from frontend is disabled";
+
+    const silent =
+      silentFromConfig ||
+      silentFromError ||
+      isSchemaNoise;
+
+    if (!silent && status !== 403 && typeof window !== "undefined") {
+      // Surface the real validation message (HTTP 417 included).
+      surfaceErrorToast(toastMessage);
+    }
+
+    // Mutate the AxiosError's message in place rather than wrapping it
+    // in a fresh `Error`. This keeps `error.response`, `error.config`,
+    // `error.code` accessible to callers that want to inspect the raw
+    // axios payload (e.g. the SQ catch block reading
+    // `err.response?.data?.exc_type`), while still surfacing the parsed
+    // Frappe message via `error.message` for `react-query` and `await`
+    // consumers that only read that property.
+    error.message = String(message);
+
+    if (!silent) {
+      logFailedApiRequest(error, {
+        context: "erpnext.interceptor",
+        retryCount: config?.__retryCount,
+      });
+    }
+
+    return Promise.reject(error);
+  }
+);
+
+/**
+ * Show at most one toast every 2.5 seconds and dedupe identical messages
+ * within a 5-second window. Without this, a dashboard load against an
+ * unreachable backend stacks 10+ identical "Network Error" toasts on top
+ * of each other and visually obscures the page.
+ */
+const recentToasts = new Map<string, number>();
+let lastToastAt = 0;
+
+/**
+ * Guard: never surface infrastructure / backend details to end users.
+ * Matches Python tracebacks, Frappe internals, ERPNext module paths,
+ * import errors, SQL errors, and low-level connection strings.
+ * In dev builds the raw message is ALSO logged to the console, but the
+ * toast always shows the sanitized version.
+ */
+/**
+ * Formats user-facing error messages without masking ERPNext validation errors.
+ * If an UpdateAfterSubmitError occurs, returns the exact field causing the error.
+ */
+function sanitizeUserMessage(message: string): string {
+  if (
+    /Warehouse E-Sign Envelope/i.test(message) ||
+    (/Not allowed to change .+ after submission/i.test(message) &&
+      /warehouse/i.test(message))
+  ) {
+    return "The GRN has already been finalized.";
+  }
+  if (
+    /\bUpdateAfterSubmitError\b/i.test(message) ||
+    /Not allowed to change .+ after submission/i.test(message)
+  ) {
+    return "This document has already been submitted and cannot be changed.";
+  }
+
+  return message;
+}
+
+function surfaceErrorToast(rawMessage: string) {
+  const message = sanitizeUserMessage(rawMessage);
+  const now = Date.now();
+  const lastForMessage = recentToasts.get(message) ?? 0;
+
+  if (now - lastForMessage < 5_000) return;
+  if (now - lastToastAt < 2_500) {
+    recentToasts.set(message, now);
+    return;
+  }
+
+  recentToasts.set(message, now);
+  lastToastAt = now;
+  toast.error(message, { id: "erpnext-error" });
+
+  if (recentToasts.size > 32) {
+    for (const [key, ts] of recentToasts) {
+      if (now - ts > 30_000) recentToasts.delete(key);
+    }
+  }
+}
+
+export type FilterOperator =
+  | "="
+  | "!="
+  | ">"
+  | "<"
+  | ">="
+  | "<="
+  | "like"
+  | "not like"
+  | "in"
+  | "not in"
+  | "is"
+  | "between"
+  | "Timespan";
+
+export type FilterValue =
+  | string
+  | number
+  | boolean
+  | null
+  | Array<string | number>;
+
+/** A single Frappe filter tuple: [field, operator, value] or [parent_doctype, field, operator, value]. */
+export type Filter =
+  | [string, FilterOperator, FilterValue]
+  | [string, string, FilterOperator, FilterValue];
+
+/** Standard list-endpoint query parameters for any Frappe resource. */
+export interface ListParams {
+  filters?: Filter[] | Record<string, FilterValue>;
+  fields?: string[];
+  limit_page_length?: number;
+  limit_start?: number;
+  order_by?: string;
+  parent?: string;
+  as_dict?: boolean;
+}
+
+/**
+ * Build an Axios request config from `ListParams`, JSON-stringifying the
+ * `filters` and `fields` keys the way Frappe's REST API expects.
+ */
+export function buildListConfig(params?: ListParams): AxiosRequestConfig {
+  if (!params) return {};
+  const out: Record<string, string | number | boolean> = {};
+  if (params.filters !== undefined)
+    out.filters = JSON.stringify(params.filters);
+  if (params.fields !== undefined) out.fields = JSON.stringify(params.fields);
+  if (params.limit_page_length !== undefined)
+    out.limit_page_length = params.limit_page_length;
+  if (params.limit_start !== undefined) out.limit_start = params.limit_start;
+  if (params.order_by) out.order_by = params.order_by;
+  if (params.parent) out.parent = params.parent;
+  if (params.as_dict !== undefined) out.as_dict = params.as_dict;
+  return { params: out };
+}
+
+/**
+ * Build a `/api/resource/<Doctype>[/<name>]` URL with proper encoding so
+ * doctypes containing spaces (e.g. "Purchase Requisition") work correctly.
+ */
+export function buildResourceUrl(doctype: string, name?: string): string {
+  const base = `/api/resource/${encodeURIComponent(doctype)}`;
+  return name ? `${base}/${encodeURIComponent(name)}` : base;
+}
+
+export async function apiGet<T = unknown>(
+  url: string,
+  config?: AxiosRequestConfig
+): Promise<T> {
+  return erpnext.get(url, config) as unknown as Promise<T>;
+}
+
+export async function apiPost<T = unknown>(
+  url: string,
+  data?: unknown,
+  config?: AxiosRequestConfig
+): Promise<T> {
+  return erpnext.post(url, data, config) as unknown as Promise<T>;
+}
+
+export async function apiPut<T = unknown>(
+  url: string,
+  data?: unknown,
+  config?: AxiosRequestConfig
+): Promise<T> {
+  return erpnext.put(url, data, config) as unknown as Promise<T>;
+}
+
+export async function apiDelete<T = unknown>(
+  url: string,
+  config?: AxiosRequestConfig
+): Promise<T> {
+  return erpnext.delete(url, config) as unknown as Promise<T>;
+}
+
+const SERVER_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+/** Netlink / BidSphere business default — matches ERP System Settings target. */
+const DEFAULT_ERP_TIME_ZONE =
+  (import.meta.env.VITE_ERP_TIME_ZONE as string | undefined)?.trim() ||
+  "Asia/Kolkata";
+
+/** Format an instant as YYYY-MM-DD in an IANA timezone (ERP System Settings). */
+function ymdInTimeZone(date: Date, timeZone: string): string | null {
+  try {
+    const parts = new Intl.DateTimeFormat("en-CA", {
+      timeZone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).formatToParts(date);
+    const y = parts.find((p) => p.type === "year")?.value;
+    const m = parts.find((p) => p.type === "month")?.value;
+    const d = parts.find((p) => p.type === "day")?.value;
+    if (!y || !m || !d) return null;
+    const iso = `${y}-${m}-${d}`;
+    return SERVER_DATE_RE.test(iso) ? iso : null;
+  } catch {
+    return null;
+  }
+}
+
+export type ErpServerDateInfo = {
+  today: string;
+  timeZone: string;
+  utcToday: string | null;
+  source: string;
+  systemSettingsTimeZone: string | null;
+};
+
+/**
+ * Full ERP calendar-date probe (for GRN debug logs).
+ * Prefer `/api/erp-server-date` which resolves today in System Settings TZ
+ * (not UTC). Falls back to direct ERP calls from the browser.
+ */
+export async function fetchErpServerDateInfo(): Promise<ErpServerDateInfo | null> {
+  // 1) BidSphere backend — uses ERP System Settings TZ (or Asia/Kolkata default)
+  try {
+    const res = await axios.get("/api/erp-server-date", {
+      timeout: 8_000,
+      headers: {
+        Accept: "application/json",
+        ...(readErpProxyAccessToken()
+          ? { "X-Bidsphere-Access-Token": readErpProxyAccessToken()! }
+          : {}),
+      },
+      validateStatus: (s) => s < 500,
+    });
+    const body = res.data as {
+      today?: string;
+      time_zone?: string;
+      utc_today?: string;
+      source?: string;
+      system_settings_time_zone?: string | null;
+      message?: {
+        today?: string;
+        time_zone?: string;
+        utc_today?: string;
+        source?: string;
+        system_settings_time_zone?: string | null;
+      };
+    };
+    const today = (body.today ?? body.message?.today)?.trim();
+    if (today && SERVER_DATE_RE.test(today)) {
+      const info: ErpServerDateInfo = {
+        today,
+        timeZone:
+          body.time_zone ??
+          body.message?.time_zone ??
+          DEFAULT_ERP_TIME_ZONE,
+        utcToday: body.utc_today ?? body.message?.utc_today ?? null,
+        source: body.source ?? body.message?.source ?? "erp-server-date",
+        systemSettingsTimeZone:
+          body.system_settings_time_zone ??
+          body.message?.system_settings_time_zone ??
+          null,
+      };
+      // eslint-disable-next-line no-console
+      console.log("[fetchErpServerDateInfo]", {
+        BrowserDate: ymdInTimeZone(new Date(), Intl.DateTimeFormat().resolvedOptions().timeZone),
+        ServerDate: info.today,
+        ERPToday: info.today,
+        UTCToday: info.utcToday,
+        TimeZone: info.timeZone,
+        SystemSettingsTimeZone: info.systemSettingsTimeZone,
+        Source: info.source,
+      });
+      return info;
+    }
+  } catch {
+    /* fall through */
+  }
+
+  // 2) Exact nowdate() when Server Scripts are enabled
+  try {
+    const res = (await erpnext.get("/api/method/bidsphere_server_date", {
+      _silent: true,
+      timeout: 5_000,
+    } as AxiosRequestConfig & SilentRequestConfig)) as unknown;
+    const today =
+      typeof res === "string"
+        ? res
+        : typeof res === "object" && res && "today" in res
+          ? (res as { today?: string }).today
+          : undefined;
+    if (typeof today === "string" && SERVER_DATE_RE.test(today.trim())) {
+      return {
+        today: today.trim(),
+        timeZone: DEFAULT_ERP_TIME_ZONE,
+        utcToday: ymdInTimeZone(new Date(), "UTC"),
+        source: "bidsphere_server_date",
+        systemSettingsTimeZone: null,
+      };
+    }
+  } catch {
+    /* fall through */
+  }
+
+  // 3) Browser-side: HTTP Date → System Settings TZ (never prefer bare UTC day)
+  try {
+    const res = (await erpnext.get("/api/method/frappe.auth.get_logged_user", {
+      _preserveResponse: true,
+      _silent: true,
+      timeout: 5_000,
+    } as AxiosRequestConfig & SilentRequestConfig)) as unknown as AxiosResponse;
+
+    const header = res?.headers?.["date"] ?? res?.headers?.["Date"];
+    if (typeof header !== "string") return null;
+    const parsed = new Date(header);
+    if (Number.isNaN(parsed.getTime())) return null;
+
+    let settingsTz: string | null = null;
+    try {
+      const viaGetValue = (await erpnext.get(
+        "/api/method/frappe.client.get_value",
+        {
+          params: {
+            doctype: "System Settings",
+            fieldname: "time_zone",
+          },
+          _silent: true,
+          timeout: 5_000,
+        } as AxiosRequestConfig & SilentRequestConfig,
+      )) as unknown;
+      const tz =
+        typeof viaGetValue === "object" && viaGetValue
+          ? (viaGetValue as { time_zone?: string }).time_zone
+          : undefined;
+      if (typeof tz === "string" && tz.trim()) settingsTz = tz.trim();
+    } catch {
+      /* optional */
+    }
+
+    let effectiveTz = settingsTz || DEFAULT_ERP_TIME_ZONE;
+    // If ERP Settings still say UTC, use business default for calendar today
+    // (run `node scripts/setup-erp-timezone.mjs` so nowdate() matches).
+    if (
+      settingsTz &&
+      /^(UTC|Etc\/UTC|GMT|Etc\/GMT)$/i.test(settingsTz) &&
+      !/^(UTC|Etc\/UTC|GMT|Etc\/GMT)$/i.test(DEFAULT_ERP_TIME_ZONE)
+    ) {
+      effectiveTz = DEFAULT_ERP_TIME_ZONE;
+    }
+
+    const today = ymdInTimeZone(parsed, effectiveTz);
+    if (!today) return null;
+
+    const info: ErpServerDateInfo = {
+      today,
+      timeZone: effectiveTz,
+      utcToday: ymdInTimeZone(parsed, "UTC"),
+      source: `HTTP Date → ${effectiveTz}`,
+      systemSettingsTimeZone: settingsTz,
+    };
+    // eslint-disable-next-line no-console
+    console.log("[fetchErpServerDateInfo] fallback", info);
+    return info;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * ERPNext site calendar "today" as `YYYY-MM-DD` — same basis as
+ * `frappe.utils.nowdate()` after System Settings.time_zone is correct.
+ *
+ * Never use bare `toISOString().slice(0, 10)` (UTC) — that made
+ * 2026-07-31 (IST) look like 2026-07-30 and blocked same-day GRNs.
+ */
+export async function fetchServerDate(): Promise<string | null> {
+  const info = await fetchErpServerDateInfo();
+  return info?.today ?? null;
+}
+
+/**
+ * The ERPNext server's current epoch (ms, UTC), read from the HTTP `Date`
+ * response header of a lightweight request. Used to synchronize time-critical
+ * UI (e.g. the reverse-auction countdown) to server time rather than the
+ * browser clock, which may be skewed. Returns `null` if unavailable.
+ */
+export async function fetchServerTimeMs(): Promise<number | null> {
+  try {
+    const res = (await erpnext.get("/api/method/frappe.auth.get_logged_user", {
+      _preserveResponse: true,
+      _silent: true,
+      timeout: 5_000,
+    } as AxiosRequestConfig & SilentRequestConfig)) as unknown as AxiosResponse;
+    const header = res?.headers?.["date"] ?? res?.headers?.["Date"];
+    if (typeof header === "string") {
+      const ms = new Date(header).getTime();
+      if (Number.isFinite(ms)) return ms;
+    }
+  } catch {
+    // Silent — callers fall back to the client clock (offset 0).
+  }
+  return null;
+}
+
+/**
+ * Returns the count of records in `doctype` that match `filters`, by fetching
+ * names from the REST resource endpoint (avoids non-whitelisted method calls).
+ */
+export async function getCount(
+  doctype: string,
+  filters?: Filter[] | Record<string, FilterValue>
+): Promise<number> {
+  try {
+    const params: Record<string, string | number> = {
+      fields: JSON.stringify(["name"]),
+      limit_page_length: 500,
+    };
+    if (filters !== undefined) {
+      if (Array.isArray(filters) && filters.length > 0) {
+        params.filters = JSON.stringify(filters);
+      } else if (
+        !Array.isArray(filters) &&
+        Object.keys(filters).length > 0
+      ) {
+        params.filters = JSON.stringify(filters);
+      }
+    }
+    const data = await apiGet<unknown[]>(buildResourceUrl(doctype), {
+      params,
+    });
+    return Array.isArray(data) ? data.length : 0;
+  } catch {
+    return 0;
+  }
+}
+
+
+/**
+ * Result shape for `fetchPagedList` — matches what every paginated list page
+ * needs to render "Showing X–Y of Z records" + page controls without any
+ * extra client-side math.
+ */
+export interface PagedListResult<T> {
+  data: T[];
+  total_records: number;
+  total_pages: number;
+  current_page: number;
+  page_size: number;
+}
+
+/**
+ * Exact total record count for `doctype` matching `filters`, via Frappe's own
+ * `frappe.client.get_count` whitelisted method — the same call Frappe's List
+ * View uses internally. Unlike `getCount` above (which pages through the
+ * resource endpoint and caps at 500), this returns the true total regardless
+ * of dataset size, which server-side pagination needs to compute total pages.
+ */
+export async function getExactCount(
+  doctype: string,
+  filters?: Filter[] | Record<string, FilterValue>,
+  orFilters?: Filter[],
+): Promise<number> {
+  try {
+    const params: Record<string, string> = { doctype };
+    const hasFilters =
+      filters !== undefined &&
+      (Array.isArray(filters) ? filters.length > 0 : Object.keys(filters).length > 0);
+    if (hasFilters) params.filters = JSON.stringify(filters);
+    if (orFilters && orFilters.length > 0) {
+      params.or_filters = JSON.stringify(orFilters);
+    }
+
+    const result = await apiGet<number | string>(
+      "/api/method/frappe.client.get_count",
+      { params }
+    );
+    const n = typeof result === "number" ? result : Number(result);
+    return Number.isFinite(n) ? n : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Generic server-side pagination for any Frappe resource: fetches exactly one
+ * page of records (`limit_start`/`limit_page_length`) alongside the exact
+ * total count, and returns everything a `PaginationBar` needs to render.
+ *
+ * This is the standard way every "All <X>" list page in the Procurement
+ * System should fetch its rows — never fetch the whole doctype client-side
+ * and slice it in JS.
+ */
+export async function fetchPagedList<T = unknown>(
+  doctype: string,
+  options: {
+    fields: string[];
+    filters?: Filter[] | Record<string, FilterValue>;
+    order_by?: string;
+    page: number;
+    pageSize: number;
+  }
+): Promise<PagedListResult<T>> {
+  const { fields, filters, order_by, page, pageSize } = options;
+  const safePage = Math.max(1, Math.floor(page) || 1);
+  const safePageSize = Math.max(1, Math.floor(pageSize) || 10);
+  const limit_start = (safePage - 1) * safePageSize;
+
+  const [data, total_records] = await Promise.all([
+    apiGet<T[]>(
+      buildResourceUrl(doctype),
+      buildListConfig({
+        fields,
+        filters,
+        order_by,
+        limit_start,
+        limit_page_length: safePageSize,
+      })
+    ),
+    getExactCount(doctype, filters),
+  ]);
+
+  const total_pages = Math.max(1, Math.ceil(total_records / safePageSize));
+  const current_page = Math.min(safePage, total_pages);
+
+  return {
+    data: Array.isArray(data) ? data : [],
+    total_records,
+    total_pages,
+    current_page,
+    page_size: safePageSize,
+  };
+}
+
+interface ErpNextErrorPayload {
+  message?: string | { message?: string };
+  error?: string;
+  field_errors?: Record<string, string>;
+  /** ERPNext attaches the full Python traceback as a JSON-encoded list. */
+  exc?: string | string[];
+  exception?: string;
+  exc_type?: string;
+  /**
+   * `_server_messages` is itself a JSON-encoded list of JSON-encoded strings
+   * (each containing `{title, message, indicator, raise_exception}`).
+   * Frappe's two layers of stringification are why parsing is fiddly.
+   */
+  _server_messages?: string | unknown[];
+  _error_message?: string;
+}
+
+/**
+ * Turn Frappe LinkValidationError payloads into plain-language messages
+ * (e.g. "Could not find HSN/SAC: 85247" → user-friendly guidance).
+ */
+function friendlyLinkValidationMessage(
+  data: ErpNextErrorPayload | undefined
+): string | null {
+  if (!data) return null;
+
+  const parts: string[] = [];
+  const combined = extractErpNextError(data);
+  if (combined) parts.push(combined);
+  if (data.exception) parts.push(stripHtml(String(data.exception)));
+  if (typeof data.message === "string" && data.message) {
+    parts.push(stripHtml(data.message));
+  } else if (data.message && typeof data.message === "object") {
+    const nested = (data.message as { message?: unknown }).message;
+    if (typeof nested === "string" && nested) parts.push(stripHtml(nested));
+  }
+
+  const raw = parts.join(" | ");
+  if (!raw) return null;
+
+  // Capture multi-word Link values (e.g. "Cost Head", "Raw Material").
+  const couldNotFind = raw.match(
+    /Could not find\s+([^:]+):\s*(.+?)(?:\s*\||\s*$)/i,
+  );
+  if (couldNotFind) {
+    const label = couldNotFind[1].trim();
+    const value = couldNotFind[2]
+      .trim()
+      .replace(/^['"]|['"]$/g, "")
+      .replace(/[,;:]+$/g, "");
+    if (/hsn|sac/i.test(label)) {
+      return `HSN Code ${value} does not exist. Please create it first.`;
+    }
+    return `${label} "${value}" does not exist. Please create it first.`;
+  }
+
+  if (/LinkValidationError/i.test(raw)) {
+    return raw
+      .replace(/frappe\.exceptions\.LinkValidationError:\s*/gi, "")
+      .replace(/^[^:]+:\s*/, "")
+      .trim();
+  }
+
+  return null;
+}
+
+/** Map MandatoryError (e.g. missing HSN/SAC on Item) to plain language. */
+function friendlyMandatoryErrorMessage(
+  data: ErpNextErrorPayload | undefined
+): string | null {
+  if (!data) return null;
+
+  const combined = extractErpNextError(data);
+  const exception = data.exception ? stripHtml(String(data.exception)) : "";
+  const msg =
+    typeof data.message === "string"
+      ? data.message
+      : data.message && typeof data.message === "object"
+        ? String(
+            (data.message as { message?: unknown }).message || "",
+          )
+        : "";
+  const raw = [combined, exception, msg]
+    .filter((part) => typeof part === "string" && part.length > 0)
+    .join(" | ");
+
+  if (/HSN|SAC/i.test(raw)) {
+    return "ERPNext requires an HSN/SAC Code for this item.";
+  }
+
+  if (combined) return stripHtml(combined);
+  if (exception) {
+    return exception.replace(/frappe\.exceptions\.MandatoryError:\s*/gi, "").trim();
+  }
+
+  return null;
+}
+
+/**
+ * are detected first so the user sees an actionable hint rather than a
+ * generic "Network Error" string. For real ERPNext validation failures
+ * we drill into `_server_messages` / `exc` / `exception` so the user sees
+ * the *actual* server-side complaint instead of a vague "Request failed".
+ */
+function friendlyErrorMessage(
+  error: AxiosError<ErpNextErrorPayload>
+): string {
+  // Client-facing connection notice — no infrastructure details (no "ERPNext",
+  // "bench", URLs, ports, or status codes). Developers still get the technical
+  // wording in dev builds to aid debugging.
+  const GENERIC_UNAVAILABLE =
+    "Unable to reach the application server. Please try again in a few seconds.";
+  const devOr = (devMessage: string) =>
+    import.meta.env.DEV ? devMessage : GENERIC_UNAVAILABLE;
+
+  // Prefer server-provided application error bodies over a generic
+  // "connection" toast (e.g. 417 Field not permitted, validation).
+  const data = error.response?.data;
+  const serverBodyMessage =
+    data && typeof data === "object"
+      ? (() => {
+          const d = data as ErpNextErrorPayload & { error?: unknown };
+          if (typeof d.error === "string" && d.error.trim()) return d.error.trim();
+          if (typeof d.message === "string" && d.message.trim())
+            return d.message.trim();
+          if (typeof d.exception === "string" && d.exception.trim())
+            return stripHtml(d.exception);
+          return null;
+        })()
+      : null;
+
+  // Client-side timeout (axios aborts after the configured `timeout`).
+  if (
+    error.code === "ECONNABORTED" ||
+    (error.message ?? "").toLowerCase().includes("timeout")
+  ) {
+    return devOr("Connection timed out. Is the backend proxy target running?");
+  }
+
+  // Network is offline / DNS failed / connection refused.
+  if (error.code === "ERR_NETWORK" || error.message === "Network Error") {
+    return devOr("Could not reach the backend. Check that the server is running.");
+  }
+
+  const status = error.response?.status;
+  if (status === 504) {
+    return serverBodyMessage || devOr("Server not responding (504).");
+  }
+  if (status === 502) {
+    // Proxy upstream down — keep actionable copy, never invent a browser-offline story.
+    return (
+      serverBodyMessage ||
+      "Unable to reach the application server. Please try again in a few seconds."
+    );
+  }
+  if (status === 503) {
+    return serverBodyMessage || devOr("Server is temporarily unavailable (503).");
+  }
+
+  // Application errors (417, 403, 409, …) — never remap to a connection message.
+  if (status && status >= 400 && status < 500 && serverBodyMessage) {
+    if (/Field not permitted in query/i.test(serverBodyMessage)) {
+      return serverBodyMessage;
+    }
+  }
+
+  // 1a. CSRFTokenError on token auth means the caller hit a method
+  //     endpoint that needs a session (e.g. `frappe.client.insert`).
+  //     Use `/api/resource/<Doctype>` for writes, which honors token
+  //     auth without CSRF.
+  if (data?.exc_type === "CSRFTokenError") {
+    return devOr(
+      "Authentication error. Check BIDSPHERE_ERP_API_KEY and BIDSPHERE_ERP_API_SECRET in .env."
+    );
+  }
+
+  if (data?.exc_type === "LinkValidationError") {
+    return (
+      friendlyLinkValidationMessage(data) ??
+      "A linked record is missing. Please check your selections."
+    );
+  }
+
+  if (data?.exc_type === "MandatoryError") {
+    return (
+      friendlyMandatoryErrorMessage(data) ??
+      "Please fill in all required fields."
+    );
+  }
+
+  // 1. Combine all server messages + the exc exception line so the real
+  //    ValidationError is never hidden behind an informational alert.
+  const combined = extractErpNextError(data);
+  if (combined) return combined;
+
+  // 3. _error_message / message / exception in plain string form.
+  if (data?._error_message) return stripHtml(data._error_message);
+  if (typeof data?.message === "string" && data.message) {
+    return stripHtml(data.message);
+  }
+  if (data?.exception) return stripHtml(data.exception);
+
+  // 4. Last resort — surface the raw response body so the developer at
+  //    least has *something* to grep for, instead of "Request failed".
+  if (data && typeof data === "object") {
+    try {
+      const blob = JSON.stringify(data).slice(0, 240);
+      if (blob && blob !== "{}") return blob;
+    } catch {
+      /* ignore */
+    }
+  }
+
+  if (error.message) return error.message;
+  return "An unexpected error occurred while contacting the server.";
+}
+
+/**
+ * `_server_messages` is a JSON string whose elements are themselves JSON
+ * strings of `{message, title, indicator}`. Frappe can stack several
+ * (an informational alert *and* the real validation error), so we unwrap
+ * **all** of them and return each human-readable message. Taking only the
+ * first one is what previously hid the real error behind a benign
+ * "Item Price added…" alert.
+ */
+function parseAllServerMessages(raw: unknown): string[] {
+  const out: string[] = [];
+  if (raw == null) return out;
+
+  let outer: unknown = raw;
+  if (typeof raw === "string") {
+    try {
+      outer = JSON.parse(raw);
+    } catch {
+      out.push(stripHtml(raw));
+      return out;
+    }
+  }
+
+  if (!Array.isArray(outer)) {
+    if (typeof outer === "string") out.push(stripHtml(outer));
+    return out;
+  }
+
+  for (const entry of outer) {
+    if (typeof entry === "string") {
+      try {
+        const inner = JSON.parse(entry) as {
+          message?: string;
+          title?: string;
+        };
+        const m = inner?.message || inner?.title;
+        if (m) out.push(stripHtml(String(m)));
+      } catch {
+        out.push(stripHtml(entry));
+      }
+    } else if (entry && typeof entry === "object") {
+      const obj = entry as { message?: string; title?: string };
+      const m = obj.message || obj.title;
+      if (m) out.push(stripHtml(String(m)));
+    }
+  }
+  return out;
+}
+
+/** Strip Frappe exception class prefixes so toasts show the real validation text. */
+export function cleanErpValidationMessage(raw: string): string {
+  return stripHtml(raw)
+    .replace(/^frappe\.exceptions\.\w+:\s*/gi, "")
+    .replace(
+      /^(ValidationError|MandatoryError|LinkValidationError|PermissionError|DoesNotExistError|UniqueValidationError|InvalidWarehouseCompanyError):\s*/gi,
+      "",
+    )
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * Combine everything Frappe tells us about a failure into one message:
+ * `_server_messages` + `exc` + `exception` + `message`, de-duplicated.
+ * Prefer the clean validation text (never hide it behind a generic toast).
+ */
+function extractErpNextError(
+  data: ErpNextErrorPayload | undefined,
+): string | null {
+  if (!data) return null;
+  const parts: string[] = [];
+
+  const push = (value: string | null | undefined) => {
+    if (!value) return;
+    const cleaned = cleanErpValidationMessage(String(value));
+    if (!cleaned) return;
+    // Drop pure traceback noise; keep the validation line.
+    if (/^Traceback \(most recent call last\)/i.test(cleaned)) return;
+    if (!parts.includes(cleaned)) parts.push(cleaned);
+  };
+
+  if (data._server_messages) {
+    for (const m of parseAllServerMessages(data._server_messages)) {
+      push(m);
+    }
+  }
+  if (data.exc) {
+    push(parseExc(data.exc));
+  }
+  if (data.exception) {
+    push(String(data.exception));
+  }
+  if (typeof data.message === "string" && data.message) {
+    push(data.message);
+  } else if (data.message && typeof data.message === "object") {
+    // Some endpoints nest `{ message: { message: "..." } }`.
+    const nested = data.message as { message?: unknown };
+    if (typeof nested.message === "string") push(nested.message);
+  }
+  if (data._error_message) {
+    push(String(data._error_message));
+  }
+
+  return parts.length ? parts.join(" | ") : null;
+}
+
+/**
+ * Public helper — parse any Frappe/ERPNext error payload (incl. HTTP 417)
+ * into a user-facing validation message.
+ */
+export function extractErpNextErrorMessage(data: unknown): string | null {
+  if (!data || typeof data !== "object") return null;
+  return extractErpNextError(data as ErpNextErrorPayload);
+}
+
+/**
+ * `exc` looks like `["Traceback (...)\\nValidationError: <message>"]`.
+ * We pull out the last non-empty traceback line which is almost always
+ * the exception class plus its message.
+ */
+function parseExc(raw: unknown): string | null {
+  try {
+    let trace: unknown = raw;
+    if (typeof raw === "string") {
+      try {
+        const arr = JSON.parse(raw);
+        trace = Array.isArray(arr) ? arr[0] : raw;
+      } catch {
+        trace = raw;
+      }
+    } else if (Array.isArray(raw)) {
+      trace = raw[0];
+    }
+    if (typeof trace !== "string") return null;
+    const lines = trace
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (lines.length === 0) return null;
+    // Prefer the last ValidationError / MandatoryError line when present.
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i];
+      if (
+        /ValidationError|MandatoryError|LinkValidationError|DoesNotExistError|PermissionError|does not belong|Mandatory field/i.test(
+          line,
+        )
+      ) {
+        return stripHtml(line);
+      }
+    }
+    return stripHtml(lines[lines.length - 1]);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Extract the DocType and document name from a Frappe resource URL.
+ * e.g. `/api/resource/Request%20for%20Quotation/PUR-RFQ-2026-00020`
+ *   → { doctype: "Request for Quotation", name: "PUR-RFQ-2026-00020" }
+ */
+function extractDocNameFromUrl(
+  url: string | undefined
+): { doctype: string; name: string } | null {
+  if (!url) return null;
+  const match = url.match(/\/api\/resource\/([^/]+)\/([^/?]+)/);
+  if (!match) return null;
+  return {
+    doctype: decodeURIComponent(match[1]),
+    name: decodeURIComponent(match[2]),
+  };
+}
+
+function stripHtml(value: string): string {
+  return value.replace(/<[^>]*>/g, "").trim();
+}
+
+/**
+ * Returns `true` when an error originates from a missing ERPNext document
+ * (404 or `DoesNotExistError`). Pages can use this to render an empty state
+ * instead of showing error banners.
+ */
+export function isDocNotFoundError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const axErr = err as AxiosError & { _isDocNotFound?: boolean };
+  if (axErr._isDocNotFound) return true;
+  const status = axErr.response?.status;
+  const excType = (axErr.response?.data as ErpNextErrorPayload | undefined)?.exc_type;
+  return status === 404 || excType === "DoesNotExistError";
+}
+
+/**
+ * Compatibility re-export — some modules historically imported this from
+ * `erpnext.ts`. Implementation lives in `utils/permissionError` (no workflow
+ * logic). Safe to import from either path.
+ */
+export { isPermissionDeniedError } from "../utils/permissionError";
+
+export default erpnextClient;
