@@ -306,25 +306,25 @@ const server = http.createServer(async (req, res) => {
   // 3. Unified Login Page (/ and /login)
   // ---------------------------------------------------------------------------
   if (pathname === "/" || pathname === "/login") {
-    // If user is already authenticated on both -> redirect to application selection
-    if (isBidsphereAuthed && isPdmAuthed) {
-      res.writeHead(302, { Location: "/select-application" });
-      res.end();
-      return;
-    }
-
-    // If user is already authenticated on BidSphere only -> redirect to BidSphere
-    if (isBidsphereAuthed && !url.searchParams.has("logout")) {
-      res.writeHead(302, { Location: "/bidsphere/dashboard" });
-      res.end();
-      return;
-    }
-
-    // If user is already authenticated on PDM only -> redirect to PDM
-    if (isPdmAuthed && !url.searchParams.has("logout")) {
-      res.writeHead(302, { Location: "/project-management/dashboard" });
-      res.end();
-      return;
+    // Only auto-redirect to app if user navigated directly to root "/" with NO query parameters
+    // If user visited "/login" or has "?redirect=", "?unauthorized=", "?error=", "?logout=", NEVER auto-redirect.
+    const hasParams = Boolean(url.search && url.search.length > 1);
+    if (pathname === "/" && !hasParams) {
+      if (isBidsphereAuthed && isPdmAuthed) {
+        res.writeHead(302, { Location: "/select-application" });
+        res.end();
+        return;
+      }
+      if (isBidsphereAuthed) {
+        res.writeHead(302, { Location: "/bidsphere/dashboard" });
+        res.end();
+        return;
+      }
+      if (isPdmAuthed) {
+        res.writeHead(302, { Location: "/project-management/dashboard" });
+        res.end();
+        return;
+      }
     }
 
     // Render Unified Login page
