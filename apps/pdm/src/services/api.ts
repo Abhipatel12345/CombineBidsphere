@@ -2,22 +2,38 @@ import axios, { AxiosInstance, AxiosRequestConfig, AxiosResponse } from 'axios';
 
 /**
  * Server/Client Base URL Resolver
- * In browser: Always use relative path ('') to route through Next.js proxy endpoints (/api/...)
+ * In browser: Use Next.js basePath ('/project-management') to route through Next.js proxy endpoints (/api/...)
  * In server-side Node: Use configured ERP_URL / NEXT_PUBLIC_ERP_URL
  */
 const getErpUrl = (): string => {
   if (typeof window !== 'undefined') {
-    return '';
+    return '/project-management';
   }
-  return process.env.ERP_URL || process.env.NEXT_PUBLIC_ERP_URL || 'http://80.225.204.210:8083';
+  return (
+    process.env.PDM_ERP_URL ||
+    process.env.ERP_URL ||
+    process.env.NEXT_PUBLIC_PDM_ERP_URL ||
+    process.env.NEXT_PUBLIC_ERP_URL ||
+    'http://80.225.204.210:8083'
+  );
 };
 
 const getApiKey = (): string => {
-  return process.env.ERP_API_KEY || process.env.NEXT_PUBLIC_API_KEY || '';
+  return (
+    process.env.PDM_ERP_API_KEY ||
+    process.env.ERP_API_KEY ||
+    process.env.NEXT_PUBLIC_API_KEY ||
+    'df5d2dc4b819ad2'
+  );
 };
 
 const getApiSecret = (): string => {
-  return process.env.ERP_API_SECRET || process.env.NEXT_PUBLIC_API_SECRET || '';
+  return (
+    process.env.PDM_ERP_API_SECRET ||
+    process.env.ERP_API_SECRET ||
+    process.env.NEXT_PUBLIC_API_SECRET ||
+    '25c592ffee48809'
+  );
 };
 
 /**
@@ -42,8 +58,13 @@ axiosClient.interceptors.request.use(
       config.baseURL = url;
     }
 
+    if (typeof window !== 'undefined' && config.url?.startsWith('/project-management/')) {
+      config.url = config.url.replace(/^\/project-management/, '');
+    }
+
     const isLocalApi =
       config.url?.startsWith('/api/') ||
+      config.url?.startsWith('/project-management/api/') ||
       (!config.url?.startsWith('http://') && !config.url?.startsWith('https://'));
 
     if (typeof window !== 'undefined' && config.data instanceof FormData) {

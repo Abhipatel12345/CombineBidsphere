@@ -22,9 +22,11 @@ export function RouteGuard({ children }: RouteGuardProps) {
 
   useEffect(() => {
     if (!isLoading && !isAuthenticated && !isPublicPath) {
-      router.push(`/login?redirect=${encodeURIComponent(pathname)}`);
+      if (typeof window !== 'undefined') {
+        window.location.replace(`/login?redirect=${encodeURIComponent(pathname)}&app=pdm`);
+      }
     }
-  }, [isLoading, isAuthenticated, isPublicPath, pathname, router]);
+  }, [isLoading, isAuthenticated, isPublicPath, pathname]);
 
   if (isLoading && !isPublicPath) {
     return (

@@ -7,13 +7,17 @@
     "apps/*"
   ],
   "scripts": {
-    "dev:bidsphere": "npm run dev --workspace=apps/bidsphere",
-    "dev:pdm": "npm run dev --workspace=apps/pdm",
+    "dev": "node scripts/dev.mjs",
+    "start": "node scripts/start.mjs",
+    "gateway": "node gateway/server.mjs",
+    "dev:bidsphere": "npm run dev --workspace=apps/bidsphere -- --port 5173",
+    "dev:pdm": "npm run dev --workspace=apps/pdm -- -p 3001",
     "build:bidsphere": "npm run build --workspace=apps/bidsphere",
     "build:pdm": "npm run build --workspace=apps/pdm",
     "build": "npm run build --workspaces --if-present",
     "test:bidsphere": "npm run test --workspace=apps/bidsphere",
     "test:pdm": "npm run test --workspace=apps/pdm",
-    "test": "npm run test --workspaces --if-present"
+    "test:gateway": "node --test gateway/tests/unified-auth.test.mjs gateway/tests/gateway-server.test.mjs",
+    "test": "npm run test:gateway && npm run test --workspaces --if-present"
   }
 }

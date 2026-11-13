@@ -30,6 +30,9 @@ export interface NavItem {
   badgeKey?: string;
   badgeUrgent?: boolean;
   children?: NavChild[];
+  childActiveState?: boolean;
+  engineerNavigation?: boolean;
+  engineeringManagerNavigation?: boolean;
 }
 
 export interface NavGroup {
@@ -60,7 +63,8 @@ export const NAV_GROUPS: NavGroup[] = [
         icon: ShoppingCart,
         children: P2P_CHILDREN,
       },
-      { label: "Suppliers", to: "/suppliers", icon: Users,
+      {
+        label: "Suppliers", to: "/suppliers", icon: Users,
         children: [
           { label: "Supplier Directory", to: "/suppliers" },
           { label: "Supplier Onboarding", to: "/suppliers/onboarding" },

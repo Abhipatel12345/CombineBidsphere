@@ -91,8 +91,10 @@ function fixture() {
           contract = (await applyClmAction({ doctype: "Contract", name: String(contract.name), action: "save", expected_modified: String(contract.modified), payload: input.contract_fields }, team, { ...deps, notify: undefined })).record;
           contract = (await applyClmAction({ doctype: "Contract", name: String(contract.name), action: "submit_review", expected_modified: String(contract.modified) }, team, { ...deps, notify: undefined })).record;
         }
-        put("Request for Quotation", { ...parent, modified: "r2", contract_required: input.decision,
-          custom_approval_data: JSON.stringify({ ...approval, contract_decision: { decision: input.decision, quotation: input.award.quotation, supplier: input.award.supplier, award: input.award.award, legal_review: input.award.legal_review, by: input.actor.id, at: deps.now(), ...approval.contract_decision, request: request?.name, contract: contract?.name } }) });
+        put("Request for Quotation", {
+          ...parent, modified: "r2", contract_required: input.decision,
+          custom_approval_data: JSON.stringify({ ...approval, contract_decision: { decision: input.decision, quotation: input.award.quotation, supplier: input.award.supplier, award: input.award.award, legal_review: input.award.legal_review, by: input.actor.id, at: deps.now(), ...approval.contract_decision, request: request?.name, contract: contract?.name } })
+        });
         return { created: !!request, request, contract };
       } catch (error) { docs.clear(); for (const [key, value] of before) docs.set(key, value); throw error; }
     });
@@ -726,11 +728,11 @@ describe("RFQ post-award conditional CLM branch", () => {
     await act("approve", principal("finance"));
     expect(await m.summary()).toMatchObject({ status: "Finance Approved", continuation_ready: true, contract: { name: contractName } });
     await assertRfqClmReadyForProcurement("RFQ-1", m.deps);
-    const existingOrder = { name: "PO-1", docstatus: 1, status: "To Receive and Bill", supplier: "SUP-1", company: "Inteva", currency: "USD",grand_total:250,custom_clm_contract:contractName,custom_clm_rfq:"RFQ-1",custom_clm_award:"LDR-1",custom_clm_creation_key:createHash("sha256").update([contractName,"LDR-1","SQ-1"].join("|")).digest("hex"), items: [{ supplier_quotation: "SQ-1", qty: 20 }] };
+    const existingOrder = { name: "PO-1", docstatus: 1, status: "To Receive and Bill", supplier: "SUP-1", company: "Inteva", currency: "USD", grand_total: 250, custom_clm_contract: contractName, custom_clm_rfq: "RFQ-1", custom_clm_award: "LDR-1", custom_clm_creation_key: createHash("sha256").update([contractName, "LDR-1", "SQ-1"].join("|")).digest("hex"), items: [{ supplier_quotation: "SQ-1", qty: 20 }] };
     m.put("Purchase Order", existingOrder);
-    const savedContract=m.get("Contract",contractName),createdPoData=parseClmData(savedContract.custom_clm_data);
-    createdPoData.procurement_order={id:"OP-1",state:"submitted",by:team.sub,role:"procurement_team",contract:contractName,rfq:"RFQ-1",award:"LDR-1",quotation:"SQ-1",supplier:"SUP-1",purchase_order:"PO-1"};
-    m.put("Contract",{...savedContract,custom_clm_data:JSON.stringify(createdPoData)});
+    const savedContract = m.get("Contract", contractName), createdPoData = parseClmData(savedContract.custom_clm_data);
+    createdPoData.procurement_order = { id: "OP-1", state: "submitted", by: team.sub, role: "procurement_team", contract: contractName, rfq: "RFQ-1", award: "LDR-1", quotation: "SQ-1", supplier: "SUP-1", purchase_order: "PO-1" };
+    m.put("Contract", { ...savedContract, custom_clm_data: JSON.stringify(createdPoData) });
     const finalized = await act("finalize_procurement", team, { purchase_order: "PO-1" });
     const data = parseClmData(finalized.record.custom_clm_data);
     expect(finalized.record.custom_contract_status).toBe("Executed");

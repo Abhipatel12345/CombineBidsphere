@@ -212,6 +212,7 @@ function actionsFor(p: AccessPrincipal, dt: ClmDoctype, record: ClmRecord, data:
       const supplierPo = clmSupplierPoWorkflow(record, data, p);
       if (p.typ === "supplier" && supplierOwns(p, record) && supplierPo?.can_accept_contract) names.push("supplier_accept");
       if (isRfqClmSignatureStage(record, data) && status === "Pending Signature" && yes(record.custom_final_version_locked)) {
+        if (p.typ === "supplier" && supplierOwns(p, record) && text(record.custom_contract_request) && !data.signatures.some(row => row.party === "supplier")) names.push("sign");
         if (exactRole(p, "legal") && sameIdentity(record.custom_inteva_signatory, actor(p)) && !data.signatures.some(row => row.party === "inteva")) names.push("sign");
       }
       if (isRfqClmSupplierSignatureStage(record, data) && p.typ === "supplier" && supplierOwns(p, record) && !data.signatures.some(row => row.party === "supplier")) names.push("sign");
@@ -254,7 +255,20 @@ function actionsFor(p: AccessPrincipal, dt: ClmDoctype, record: ClmRecord, data:
 function signatureWorkflow(p: AccessPrincipal, record: ClmRecord, data: ClmData, actions: ClmAction[]): ClmSignatureWorkflow | undefined {
   if (p.typ === "supplier") {
     const workflow = clmSupplierPoWorkflow(record, data, p);
-    if (!workflow || !supplierOwns(p, record)) return undefined;
+    if (!workflow || !supplierOwns(p, record)) {
+      if (isRfqClmSignatureStage(record, data) && text(record.custom_contract_request) && supplierOwns(p, record)) {
+        const canSign = actions.some(row => row.action === "sign");
+        return {
+          supplier_status: data.signatures.some(row => row.party === "supplier") ? "Signed" : "Pending",
+          legal_status: rfqClmLegalSigned(record, data) ? "Signed" : "Pending",
+          is_legal_signatory: false,
+          can_sign: canSign,
+          can_review: true,
+          can_request_signatures: false,
+        };
+      }
+      return undefined;
+    }
     const canSign = workflow.can_sign_contract && actions.some(row => row.action === "sign");
     const blocked = workflow.blocked_reason || (canSign ? undefined : workflow.signature_status === "Signed" ? "The Supplier signature has already been recorded." : "Accept the current Contract before Supplier E-Signature.");
     return { supplier_status: workflow.signature_status, legal_status: rfqClmLegalSigned(record, data) ? "Signed" : "Pending", is_legal_signatory: false,
@@ -880,8 +894,8 @@ export async function applyClmAction(input: ClmActionInput, p: AccessPrincipal, 
       if (!deps.sign) throw new ClmError("Contract signing is not configured.", 503);
       const signatureInput = validateClmSignatureInput(record, p, payload);
       const party = p.typ === "supplier" ? "supplier" : "inteva";
-      const optionalSupplier = rfqContract && party === "supplier" && isRfqClmSupplierSignatureStage(record, data);
-      const supplierPo = party === "supplier" ? clmSupplierPoWorkflow(record, data, p) : undefined;
+      const optionalSupplier = rfqContract && party === "supplier" && (isRfqClmSupplierSignatureStage(record, data) || (isRfqClmSignatureStage(record, data) && !!text(record.custom_contract_request)));
+      const supplierPo = party === "supplier" && isRfqClmSupplierSignatureStage(record, data) ? clmSupplierPoWorkflow(record, data, p) : undefined;
       let supplierEmail: { email: string; source: "registered_supplier_account" | "supplier_declared" } | undefined;
       if (supplierPo) {
         if (!supplierPo.can_sign_contract || !data.supplier_po_acceptance) throw new ClmError("Accept the current Contract before Supplier E-Signature.", 409);

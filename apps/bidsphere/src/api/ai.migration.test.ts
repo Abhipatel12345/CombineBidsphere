@@ -8,9 +8,9 @@ import {
 import { scoreSuppliers } from "./supplierScoringEngine";
 
 describe("Claude Model Configuration & Deduplication", () => {
-  it("centralizes model configuration to claude-3-5-sonnet-20241022", () => {
-    expect(DEFAULT_ANTHROPIC_MODEL).toBe("claude-3-5-sonnet-20241022");
-    expect(BIDSPHERE_ANTHROPIC_MODEL).toBe("claude-3-5-sonnet-20241022");
+  it("centralizes model configuration to claude-sonnet-4-5-20250929", () => {
+    expect(DEFAULT_ANTHROPIC_MODEL).toBe("claude-sonnet-4-5-20250929");
+    expect(BIDSPHERE_ANTHROPIC_MODEL).toBe("claude-sonnet-4-5-20250929");
   });
 
   it("exposes server-side Claude availability to clients", () => {

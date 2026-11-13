@@ -4,11 +4,20 @@ import { PDMUserSession } from '@/types/auth.types';
 
 const SESSION_SECRET =
   process.env.SESSION_SECRET ||
+  process.env.PDM_ERP_API_SECRET ||
   process.env.ERP_API_SECRET ||
   'pdm-enterprise-secure-session-salt-2026';
 
-const API_KEY = process.env.ERP_API_KEY || process.env.NEXT_PUBLIC_API_KEY || 'df5d2dc4b819ad2';
-const API_SECRET = process.env.ERP_API_SECRET || process.env.NEXT_PUBLIC_API_SECRET || '25c592ffee48809';
+const API_KEY =
+  process.env.PDM_ERP_API_KEY ||
+  process.env.ERP_API_KEY ||
+  process.env.NEXT_PUBLIC_API_KEY ||
+  'df5d2dc4b819ad2';
+const API_SECRET =
+  process.env.PDM_ERP_API_SECRET ||
+  process.env.ERP_API_SECRET ||
+  process.env.NEXT_PUBLIC_API_SECRET ||
+  '25c592ffee48809';
 
 export interface SignedSessionPayload {
   user: PDMUserSession;

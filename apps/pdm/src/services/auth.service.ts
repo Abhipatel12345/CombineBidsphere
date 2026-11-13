@@ -58,7 +58,11 @@ export const authService = {
    */
   async testConnection(): Promise<ConnectionTestResult> {
     const startTime = performance.now();
-    const erpUrl = process.env.NEXT_PUBLIC_ERP_URL || 'http://80.225.204.210:8083';
+    const erpUrl =
+      process.env.NEXT_PUBLIC_PDM_ERP_URL ||
+      process.env.NEXT_PUBLIC_ERP_URL ||
+      process.env.PDM_ERP_URL ||
+      'http://80.225.204.210:8083';
     const timestamp = new Date().toISOString();
 
     try {

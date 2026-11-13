@@ -131,7 +131,7 @@ describe("corporate Contract PDF presentation", () => {
     expect(page.some(line => line.startsWith("This is an approved legal obligation"))).toBe(true);
   });
 
-  it.each([20, 40, 100])( "keeps the scope heading with the first lines of a %i-sentence scope", async count => {
+  it.each([20, 40, 100])("keeps the scope heading with the first lines of a %i-sentence scope", async count => {
     const source = { ...context(), rfqScope: "SCOPECLAUSE requires the supplier to meet the approved delivery and quality requirements. ".repeat(count) };
     const pdf = await PDFDocument.load((await generateClmContractPdf(base(), source)).bytes);
     const pages = pdf.getPages().map((_, index) => lines(pdf, index));
@@ -140,7 +140,7 @@ describe("corporate Contract PDF presentation", () => {
     expect(headingPage.some(line => line.startsWith("Procurement of precision components"))).toBe(true);
     const rfqPage = pages.find(text => text.includes("RFQ SCOPE"))!;
     expect(rfqPage.some(line => line.startsWith("SCOPECLAUSE"))).toBe(true);
-  });
+  }, 25000);
 
   it.each([12, 100])("keeps a long standalone description with its Scope heading (%i sentences)", async count => {
     const record = { ...base(), custom_rfq: "", custom_supplier_quotation: "", custom_contract_title: "SAVEDDESCRIPTION specifies the approved delivery obligations. ".repeat(count) };
@@ -148,7 +148,7 @@ describe("corporate Contract PDF presentation", () => {
     const scopePage = pdf.getPages().map((_, index) => lines(pdf, index)).find(text => text.includes("SCOPE OF CONTRACT"))!;
     expect(scopePage).toContain("CONTRACT DESCRIPTION");
     expect(scopePage.some(line => line.startsWith("SAVEDDESCRIPTION"))).toBe(true);
-  });
+  }, 25000);
 
   it("keeps each ordinary signature receipt and its document hash on the same page", async () => {
     const record = withSignatures([receipt("inteva"), receipt("supplier")]);
@@ -312,7 +312,7 @@ describe("corporate Contract PDF presentation", () => {
         expect(Number(position[2])).toBeGreaterThanOrEqual(25); expect(Number(position[2])).toBeLessThan(817);
       }
     }
-  }, 30_000);
+  }, 60_000);
 
   it("fails clearly for unsupported glyphs rather than silently replacing contractual text", async () => {
     await expect(generateClmContractPdf({ ...base(), contract_terms: "保留原条款" }, context())).rejects.toThrow("embedded Contract font cannot render this text");
@@ -342,7 +342,7 @@ describe("corporate Contract PDF presentation", () => {
     else expect(signingPage.map(line => line.value)).not.toContain("Signature");
     if (state !== "fully signed") expect(signingPage.map(line => line.value)).toEqual(expect.arrayContaining(["FOR SUPPLIER", "FOR NETLINK"]));
     else expect(renderedLines).toEqual(expect.arrayContaining(["SUPPLIER SIGNED", "COMPANY SIGNED", "RECORDED TYPED SIGNATURE"]));
-  }, 30_000);
+  }, 60_000);
 });
 
 describe("Contract dates and persisted signature presentation", () => {

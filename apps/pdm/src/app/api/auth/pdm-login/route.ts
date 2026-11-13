@@ -4,9 +4,23 @@ import { signSession } from '@/lib/server/session';
 
 export const dynamic = 'force-dynamic';
 
-const ERP_URL = (process.env.ERP_URL || process.env.NEXT_PUBLIC_ERP_URL || 'http://80.225.204.210:8083').replace(/\/$/, '');
-const API_KEY = process.env.ERP_API_KEY || process.env.NEXT_PUBLIC_API_KEY || 'df5d2dc4b819ad2';
-const API_SECRET = process.env.ERP_API_SECRET || process.env.NEXT_PUBLIC_API_SECRET || '25c592ffee48809';
+const ERP_URL = (
+  process.env.PDM_ERP_URL ||
+  process.env.ERP_URL ||
+  process.env.NEXT_PUBLIC_PDM_ERP_URL ||
+  process.env.NEXT_PUBLIC_ERP_URL ||
+  'http://80.225.204.210:8083'
+).replace(/\/$/, '');
+const API_KEY =
+  process.env.PDM_ERP_API_KEY ||
+  process.env.ERP_API_KEY ||
+  process.env.NEXT_PUBLIC_API_KEY ||
+  'df5d2dc4b819ad2';
+const API_SECRET =
+  process.env.PDM_ERP_API_SECRET ||
+  process.env.ERP_API_SECRET ||
+  process.env.NEXT_PUBLIC_API_SECRET ||
+  '25c592ffee48809';
 
 /**
  * Map actual ERPNext Roles array and verified user identity to PDM workflow capability persona

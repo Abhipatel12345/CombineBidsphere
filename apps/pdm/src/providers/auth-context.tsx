@@ -88,8 +88,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       if (typeof window !== 'undefined') {
         localStorage.removeItem('pdm_user_session');
         localStorage.removeItem('pdm_session');
+        window.location.replace('/login?logout=success');
       }
-      router.push('/login?logout=success');
     }
   };
 

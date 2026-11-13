@@ -119,7 +119,7 @@ function authSessionDevMiddleware(): Plugin {
     } catch (err) {
       const status =
         (err as { status?: number })?.status &&
-        Number.isInteger((err as { status?: number }).status)
+          Number.isInteger((err as { status?: number }).status)
           ? (err as { status: number }).status
           : 500;
       const message =
@@ -336,7 +336,7 @@ function supplierVoucherDevMiddleware(): Plugin {
         } catch (err) {
           const status =
             (err as { status?: number })?.status &&
-            Number.isInteger((err as { status?: number }).status)
+              Number.isInteger((err as { status?: number }).status)
               ? (err as { status: number }).status
               : 500;
           const message =
@@ -635,9 +635,9 @@ function stockCheckDevMiddleware(): Plugin {
         } catch (err) {
           const status =
             err &&
-            typeof err === "object" &&
-            "status" in err &&
-            Number.isInteger((err as { status?: number }).status)
+              typeof err === "object" &&
+              "status" in err &&
+              Number.isInteger((err as { status?: number }).status)
               ? (err as { status: number }).status
               : 500;
           const message =
@@ -757,9 +757,9 @@ function recommendSuppliersDevMiddleware(): Plugin {
         } catch (err) {
           const status =
             err &&
-            typeof err === "object" &&
-            "status" in err &&
-            Number.isInteger((err as { status?: number }).status)
+              typeof err === "object" &&
+              "status" in err &&
+              Number.isInteger((err as { status?: number }).status)
               ? (err as { status: number }).status
               : 500;
           const message =
@@ -884,9 +884,9 @@ function rfqSupplierInviteDevMiddleware(): Plugin {
         } catch (err) {
           const status =
             err &&
-            typeof err === "object" &&
-            "status" in err &&
-            Number.isInteger((err as { status?: number }).status)
+              typeof err === "object" &&
+              "status" in err &&
+              Number.isInteger((err as { status?: number }).status)
               ? (err as { status: number }).status
               : 500;
           const message =
@@ -1019,19 +1019,19 @@ function rfqQuoteRoundDevMiddleware(): Plugin {
             const mapSuppliers = (rows: unknown) =>
               Array.isArray(rows)
                 ? rows
-                    .map((row: Record<string, unknown>) => {
-                      const supplier = String(row.supplier ?? "").trim();
-                      if (!supplier) return null;
-                      return {
-                        supplier,
-                        supplier_name: String(
-                          row.supplier_name ?? row.supplierName ?? supplier,
-                        ),
-                        email_id:
-                          String(row.email_id ?? row.emailId ?? "") || undefined,
-                      };
-                    })
-                    .filter((item): item is NonNullable<typeof item> => item !== null)
+                  .map((row: Record<string, unknown>) => {
+                    const supplier = String(row.supplier ?? "").trim();
+                    if (!supplier) return null;
+                    return {
+                      supplier,
+                      supplier_name: String(
+                        row.supplier_name ?? row.supplierName ?? supplier,
+                      ),
+                      email_id:
+                        String(row.email_id ?? row.emailId ?? "") || undefined,
+                    };
+                  })
+                  .filter((item): item is NonNullable<typeof item> => item !== null)
                 : undefined;
             const result = await core.createNextRfqRoundCore({
               rfqName,
@@ -1140,9 +1140,9 @@ function reverseBiddingNamingDevMiddleware(): Plugin {
         } catch (err) {
           const status =
             err &&
-            typeof err === "object" &&
-            "status" in err &&
-            Number.isInteger((err as { status?: number }).status)
+              typeof err === "object" &&
+              "status" in err &&
+              Number.isInteger((err as { status?: number }).status)
               ? (err as { status: number }).status
               : 500;
           const message =
@@ -1211,9 +1211,9 @@ function reverseBiddingSubmitDevMiddleware(): Plugin {
         } catch (err) {
           const status =
             err &&
-            typeof err === "object" &&
-            "status" in err &&
-            Number.isInteger((err as { status?: number }).status)
+              typeof err === "object" &&
+              "status" in err &&
+              Number.isInteger((err as { status?: number }).status)
               ? (err as { status: number }).status
               : 500;
           const message =
@@ -1263,7 +1263,7 @@ function poShipmentDevMiddleware(): Plugin {
         } catch (err) {
           const status =
             (err as { status?: number })?.status &&
-            Number.isInteger((err as { status?: number }).status)
+              Number.isInteger((err as { status?: number }).status)
               ? (err as { status: number }).status
               : 500;
           const message =
@@ -1419,8 +1419,8 @@ function bomDevMiddleware(): Plugin {
               action === "temporary-items-approve"
                 ? await (tempCore.approveTemporaryItem as (n: string) => Promise<unknown>)(name)
                 : await (
-                    tempCore.rejectTemporaryItem as (n: string, r?: string) => Promise<unknown>
-                  )(name, typeof body.reason === "string" ? body.reason : undefined);
+                  tempCore.rejectTemporaryItem as (n: string, r?: string) => Promise<unknown>
+                )(name, typeof body.reason === "string" ? body.reason : undefined);
             res.statusCode = 200;
             res.setHeader("Content-Type", "application/json");
             res.end(JSON.stringify({ success: true, item }));
@@ -1433,7 +1433,7 @@ function bomDevMiddleware(): Plugin {
         } catch (err) {
           const status =
             (err as { status?: number })?.status &&
-            Number.isInteger((err as { status?: number }).status)
+              Number.isInteger((err as { status?: number }).status)
               ? (err as { status: number }).status
               : 500;
           const message =
@@ -1556,8 +1556,8 @@ function supplierOnboardingDevMiddleware(): Plugin {
               const rbac = await server.ssrLoadModule("/api/rbacAuth.ts");
               const rawSupplier = String(
                 loginResult?.linked_supplier ||
-                  loginResult?.company_name ||
-                  "",
+                loginResult?.company_name ||
+                "",
               ).trim();
               const supplier =
                 stripWrappingQuotes(rawSupplier) || "supplier";
@@ -1826,7 +1826,7 @@ function supplierOnboardingDevMiddleware(): Plugin {
           const status = friendly?.status
             ? friendly.status
             : (err as { status?: number })?.status &&
-                Number.isInteger((err as { status?: number }).status)
+              Number.isInteger((err as { status?: number }).status)
               ? (err as { status: number }).status
               : 500;
           const message =
@@ -1975,8 +1975,8 @@ function fileProxyDevMiddleware(
                 } catch (aclErr) {
                   const status =
                     aclErr &&
-                    typeof aclErr === "object" &&
-                    "status" in aclErr
+                      typeof aclErr === "object" &&
+                      "status" in aclErr
                       ? Number((aclErr as { status?: number }).status) || 403
                       : 403;
                   res.statusCode =
@@ -2057,16 +2057,16 @@ function fileProxyDevMiddleware(
               }) => Promise<void>;
             }) => Promise<
               | {
-                  ok: true;
-                  status: number;
-                  buffer: Buffer;
-                  contentType: string;
-                }
+                ok: true;
+                status: number;
+                buffer: Buffer;
+                contentType: string;
+              }
               | {
-                  ok: false;
-                  status: number;
-                  body: { success: false; message: string; status: number };
-                }
+                ok: false;
+                status: number;
+                body: { success: false; message: string; status: number };
+              }
             >;
           };
 
@@ -2810,14 +2810,14 @@ function payablesRbacDevMiddleware(): Plugin {
               internal,
               ["GET", "HEAD"].includes(method)
                 ? [
-                    "engineer",
-                    "engineering",
-                    "operations",
-                    "quality",
-                    "program_manager",
-                    "procurement_team",
-                    "procurement",
-                  ]
+                  "engineer",
+                  "engineering",
+                  "operations",
+                  "quality",
+                  "program_manager",
+                  "procurement_team",
+                  "procurement",
+                ]
                 : ["procurement_team", "procurement"],
             );
             if (!["GET", "HEAD"].includes(method)) {
@@ -3834,6 +3834,7 @@ export default defineConfig(({ mode }) => {
   );
 
   return {
+    base: process.env.VITE_BASE_PATH || "/bidsphere/",
     // Config-free Vite/SSR diagnostic servers use the default .vite/deps cache.
     // Keep the app's optimized modules separate so those servers cannot remove
     // dependencies still referenced by open browser tabs (504 Outdated Optimize Dep).

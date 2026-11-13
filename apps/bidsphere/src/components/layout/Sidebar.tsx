@@ -11,6 +11,7 @@ import BrandLogo from "../BrandLogo";
 import { isChildNavActive } from "./sidebarNavState";
 import { useProcurementBadges } from "../../hooks/useProcurementBadges";
 import { procurementSidebarGroups, type SidebarNavItem } from "./procurementSidebarNav";
+import { engineerSidebarGroups } from "./engineerSidebarNav";
 
 export function isItemActive(pathname: string, to: string): boolean {
   if (!to) return false;
@@ -68,10 +69,13 @@ export default function Sidebar({
   const user = useAuthStore((s) => s.user);
   const role = normalizeAppRole(user?.role);
   const isProcurementWorkspace = role === "procurement_team" || role === "procurement";
+  const isEngineerWorkspace = role === "engineer" || role === "engineering";
   const roleGroups = getNavGroupsForRole(user?.role ?? "procurement");
   const navGroups = isProcurementWorkspace
     ? procurementSidebarGroups(roleGroups, role)
-    : roleGroups;
+    : isEngineerWorkspace
+      ? engineerSidebarGroups(roleGroups, role)
+      : roleGroups;
   const badges = useProcurementBadges();
   const collapsed = variant === "collapsed";
 
@@ -88,15 +92,13 @@ export default function Sidebar({
 
   return (
     <aside
-      className={`app-sidebar ${widthClass} bg-[#0B1630] border-r border-[#152449]/60 transition-[width] duration-200 ease-in-out select-none ${
-        fixed ? "app-sidebar-fixed" : "h-[100vh] min-h-[100vh]"
-      } ${className}`}
+      className={`app-sidebar ${widthClass} bg-[#0B1630] border-r border-[#152449]/60 transition-[width] duration-200 ease-in-out select-none ${fixed ? "app-sidebar-fixed" : "h-[100vh] min-h-[100vh]"
+        } ${className}`}
     >
       {/* Brand */}
       <div
-        className={`flex h-[52px] flex-shrink-0 items-center border-b border-white/[0.08] px-3.5 ${
-          collapsed ? "justify-center px-2" : "gap-2.5"
-        }`}
+        className={`flex h-[52px] flex-shrink-0 items-center border-b border-white/[0.08] px-3.5 ${collapsed ? "justify-center px-2" : "gap-2.5"
+          }`}
       >
         <BrandLogo size="sm" markOnly className="h-7 w-7 rounded" />
         {!collapsed && (
@@ -166,9 +168,8 @@ export default function Sidebar({
       ) : null}
 
       <div
-        className={`app-sidebar-footer border-t border-white/[0.08] py-2 px-3 text-[10px] text-slate-400 ${
-          collapsed ? "px-1 text-center" : ""
-        }`}
+        className={`app-sidebar-footer border-t border-white/[0.08] py-2 px-3 text-[10px] text-slate-400 ${collapsed ? "px-1 text-center" : ""
+          }`}
         title={collapsed ? `${COMPANY_NAME} · ${APP_NAME}` : undefined}
       >
         {collapsed ? (
@@ -279,17 +280,14 @@ function SidebarItem({
             : "bg-[#DC2626]";
 
   const linkClass = (isActive: boolean) =>
-    `group relative flex h-[36px] items-center rounded-lg text-[13px] font-medium transition-colors duration-150 ${
-      collapsed ? "justify-center px-2" : "gap-2.5 px-2.5"
-    } ${
-      isActive
-        ? "bg-[#1554D1] text-white font-semibold shadow-sm"
-        : "text-[#94A3B8] hover:bg-[#152449] hover:text-white"
+    `group relative flex h-[36px] items-center rounded-lg text-[13px] font-medium transition-colors duration-150 ${collapsed ? "justify-center px-2" : "gap-2.5 px-2.5"
+    } ${isActive
+      ? "bg-[#1554D1] text-white font-semibold shadow-sm"
+      : "text-[#94A3B8] hover:bg-[#152449] hover:text-white"
     }`;
 
   const iconClass = (isActive: boolean) =>
-    `h-[17px] w-[17px] flex-shrink-0 transition-colors ${
-      isActive ? "text-white" : "text-[#94A3B8] group-hover:text-white"
+    `h-[17px] w-[17px] flex-shrink-0 transition-colors ${isActive ? "text-white" : "text-[#94A3B8] group-hover:text-white"
     }`;
 
   if (!hasChildren) {
@@ -351,9 +349,8 @@ function SidebarItem({
       </button>
 
       <div
-        className={`grid transition-[grid-template-rows] duration-200 ease-out ${
-          expanded ? "grid-rows-[1fr]" : "grid-rows-[0fr]"
-        }`}
+        className={`grid transition-[grid-template-rows] duration-200 ease-out ${expanded ? "grid-rows-[1fr]" : "grid-rows-[0fr]"
+          }`}
       >
         <div className="overflow-hidden">
           {item.children ? (
@@ -391,20 +388,18 @@ function SidebarItem({
                       <Link
                         to={child.to}
                         onClick={onNavigate}
-                        className={`flex h-[30px] items-center px-2 text-[12px] font-medium transition-[background-color] duration-150 ease-in-out ${
-                          childActive
+                        className={`flex h-[30px] items-center px-2 text-[12px] font-medium transition-[background-color] duration-150 ease-in-out ${childActive
                             ? "rounded-md bg-[#1554D1] text-white font-semibold"
                             : "rounded-md text-[#94A3B8] hover:bg-[#152449] hover:text-white"
-                        }`}
+                          }`}
                       >
                         <span className="truncate flex-1">{translateNavLabel(t, child.label)}</span>
                         {childBadgeCount != null && childBadgeCount > 0 && (
                           <span
-                            className={`ml-1.5 min-w-[18px] h-[18px] px-1 flex items-center justify-center rounded text-[10px] font-bold shadow-xs ${
-                              childActive
+                            className={`ml-1.5 min-w-[18px] h-[18px] px-1 flex items-center justify-center rounded text-[10px] font-bold shadow-xs ${childActive
                                 ? "bg-white text-[#1554D1]"
                                 : "bg-[#2563EB] text-white"
-                            }`}
+                              }`}
                           >
                             {childBadgeCount > 99 ? "99+" : childBadgeCount}
                           </span>

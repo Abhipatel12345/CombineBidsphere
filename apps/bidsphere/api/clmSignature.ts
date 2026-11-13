@@ -72,7 +72,7 @@ export async function lockClmContract(contract: ClmRecord): Promise<ClmLockedFil
 
 export async function signClmContract(contract: ClmRecord, principal: AccessPrincipal, payload: ClmRecord): Promise<ClmSignature> {
   const data = parseClmData(contract.custom_clm_data);
-  const optionalSupplier = principal.typ === "supplier" && isRfqClmSupplierSignatureStage(contract, data);
+  const optionalSupplier = principal.typ === "supplier" && (isRfqClmSupplierSignatureStage(contract, data) || isRfqClmSignatureStage(contract, data));
   if (isRfqClmContract(contract) && principal.typ === "supplier" && !optionalSupplier) throw new ClmError("Accept the linked Contract for its submitted Purchase Order before Supplier E-Signature.", 409);
   if (isRfqClmContract(contract) && !isRfqClmSignatureStage(contract, data) && !optionalSupplier) throw new ClmError("This RFQ Contract is not in the E-Signature stage.", 409);
   if (!Number(contract.custom_final_version_locked) || !data.locked_hash || data.approvals.length === 0 || (!optionalSupplier && data.approvals.some(row => row.status !== "Approved"))) throw new ClmError("All required approvals must be completed before signature.");

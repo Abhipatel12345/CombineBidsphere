@@ -45,8 +45,10 @@ export default function UserProfileMenu() {
 
   const handleLogout = useCallback(() => {
     setOpen(false);
-    void logout().then(() => navigate("/login", { replace: true }));
-  }, [logout, navigate]);
+    void logout().then(() => {
+      window.location.replace("/login?logout=success");
+    });
+  }, [logout]);
 
   useEffect(() => {
     if (!open) return;

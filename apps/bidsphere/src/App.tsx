@@ -422,6 +422,14 @@ function RouteFallback() {
   );
 }
 
+function UnifiedLoginRedirect() {
+  useEffect(() => {
+    const search = window.location.search;
+    window.location.replace(`/login${search}`);
+  }, []);
+  return <RouteFallback />;
+}
+
 function AuthBootstrap() {
   useEffect(() => {
     let cancelled = false;
@@ -503,7 +511,7 @@ function App() {
   return (
     <ErrorBoundary>
     <QueryClientProvider client={queryClient}>
-      <BrowserRouter>
+      <BrowserRouter basename={import.meta.env.BASE_URL.replace(/\/$/, "") || "/bidsphere"}>
         <AuthBootstrap />
         <RFQSchemaBootstrap />
         <VoucherStoreSync />
@@ -529,18 +537,18 @@ function App() {
         />
         <Suspense fallback={<RouteFallback />}>
         <Routes>
-          <Route path="/login" element={<LoginPage />} />
+          <Route path="/login" element={<UnifiedLoginRedirect />} />
           <Route
             path="/warehouse/login"
-            element={<LoginPage portal="warehouse" />}
+            element={<UnifiedLoginRedirect />}
           />
           <Route
             path="/procurement/login"
-            element={<LoginPage portal="procurement" />}
+            element={<UnifiedLoginRedirect />}
           />
           <Route
             path="/department/login"
-            element={<LoginPage portal="department" />}
+            element={<UnifiedLoginRedirect />}
           />
           <Route path="/verify-otp" element={<OtpVerificationPage />} />
           <Route

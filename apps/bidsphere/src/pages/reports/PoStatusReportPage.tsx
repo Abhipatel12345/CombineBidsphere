@@ -75,7 +75,7 @@ export default function PoStatusReportPage() {
     ...DASHBOARD_QUERY_OPTIONS,
   });
 
-  const allRows = query.data?.rows ?? [];
+  const allRows = useMemo(() => query.data?.rows ?? [], [query.data?.rows]);
   const filtered = useMemo(() => {
     return allRows.filter((po) => {
       if (status && (po.status || "Draft") !== status) return false;

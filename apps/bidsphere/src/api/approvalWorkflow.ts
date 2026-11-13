@@ -127,15 +127,17 @@ export function deriveWorkflowStage(doc: LegalDocumentSet): ApprovalWorkflowStag
     return "Rejected";
   }
 
-  // 2. Trust server-persisted workflow_state for Finance and Completed stages.
-  //    The backend only writes these states after all validations pass (full
-  //    e-signature chain, legal approval). This fixes the Finance queue going
-  //    dark when esign_envelope is missing or null in the list API response.
-  if (persisted === "Finance Review") {
-    return "Finance Review";
-  }
-  if (persisted === "Completed") {
-    return "Completed";
+  // 2. Verified signatures check:
+  // If e-signatures are not executed, we do not trust approved states for Finance/Procurement handoff.
+  const signed = isLegalReviewExecuted(doc);
+
+  if (signed) {
+    if (finance === "Approved" || isRfqReadyForPurchaseOrder(doc)) {
+      return "Procurement";
+    }
+    if (finance === "Pending" && (persisted === "Finance Review" || isRfqReadyForFinance(doc))) {
+      return "Finance Review";
+    }
   }
 
   // 3. Legacy "Procurement" edge case — Pending Review with Procurement owner.
@@ -143,13 +145,7 @@ export function deriveWorkflowStage(doc: LegalDocumentSet): ApprovalWorkflowStag
     return "Procurement";
   }
 
-  // 4. Fallback reconstruction for rows without a persisted workflow_state.
-  //    isRfqReadyForPurchaseOrder / isRfqReadyForFinance parse esign_envelope
-  //    to verify signatures — only reliable when the envelope is present.
-  if (isRfqReadyForPurchaseOrder(doc)) return "Procurement";
-  if (isRfqReadyForFinance(doc)) return "Finance Review";
-
-  // 5. Default: Legal Review stage for anything else.
+  // 4. Default: Legal Review stage for anything else.
   return "Legal Review";
 }
 
@@ -254,6 +250,9 @@ export function filterByWorkflowStage(
   records: ApprovalWorkflowRecord[],
   stage: ApprovalWorkflowStage,
 ): ApprovalWorkflowRecord[] {
+  if (stage === "Completed") {
+    return records.filter((r) => r.workflowStage === "Completed" || r.workflowStage === "Procurement");
+  }
   return records.filter((r) => r.workflowStage === stage);
 }
 

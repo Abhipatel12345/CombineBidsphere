@@ -92,19 +92,27 @@ export default function ProtectedRoute({ children }: Props) {
         reason: "supplier-session-replaced-on-internal-route",
       });
     }
-    return <Navigate to={loginForPath} replace state={{ from: location }} />;
+    if (typeof window !== "undefined") {
+      const redirectUrl = encodeURIComponent(window.location.pathname + window.location.search);
+      window.location.replace(`/login?redirect=${redirectUrl}&app=bidsphere`);
+    }
+    return null;
   }
 
   if (!isAuthenticated || !user) {
     logPortalAuthDecision({
       currentUrl: path,
       currentRole: null,
-      redirectTarget: loginForPath,
+      redirectTarget: "/login",
       authSource: detectAuthSource(),
       reason: "unauthenticated-internal-route",
     });
-    authLog("redirect decision", `ProtectedRoute → ${loginForPath}`);
-    return <Navigate to={loginForPath} replace state={{ from: location }} />;
+    authLog("redirect decision", "ProtectedRoute → Unified Login (/login)");
+    if (typeof window !== "undefined") {
+      const redirectUrl = encodeURIComponent(window.location.pathname + window.location.search);
+      window.location.replace(`/login?redirect=${redirectUrl}&app=bidsphere`);
+    }
+    return null;
   }
 
   const role = normalizeAppRole(user.role);
