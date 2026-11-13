@@ -19,3 +19,4 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ message: 'Guest', user: null }, { status: 401 });
   }
 }
+

@@ -66,8 +66,8 @@ const pdm = runProcess("PDM", "npm", ["--prefix", "apps/pdm", "run", "dev", "--"
 // 2. Start BidSphere (Vite on port 5173)
 const bidsphere = runProcess("BidSphere", "npm", ["--prefix", "apps/bidsphere", "run", "dev", "--", "--port", "5173"]);
 
-// 3. Start Unified Gateway (port 3000)
-const gateway = runProcess("Gateway", "node", ["gateway/server.mjs"]);
+// 3. Start Unified Gateway (port 3000) with watch mode
+const gateway = runProcess("Gateway", "node", ["--watch", "gateway/server.mjs"]);
 
 function cleanup() {
   isShuttingDown = true;

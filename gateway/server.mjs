@@ -489,6 +489,28 @@ const server = http.createServer(async (req, res) => {
 
 
 
+  // Application alias routes (/dashboard)
+  if (pathname === "/dashboard") {
+    if (isPdmAuthed && !isBidsphereAuthed) {
+      res.writeHead(302, { Location: "/project-management/dashboard" });
+      res.end();
+      return;
+    }
+    if (isBidsphereAuthed && !isPdmAuthed) {
+      res.writeHead(302, { Location: "/bidsphere/dashboard" });
+      res.end();
+      return;
+    }
+    if (isBidsphereAuthed && isPdmAuthed) {
+      res.writeHead(302, { Location: "/select-application" });
+      res.end();
+      return;
+    }
+    res.writeHead(302, { Location: "/login" });
+    res.end();
+    return;
+  }
+
   // Fallback: Redirect to Unified Login
   res.writeHead(302, { Location: "/login" });
   res.end();

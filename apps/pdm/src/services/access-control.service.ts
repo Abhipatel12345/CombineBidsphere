@@ -155,20 +155,23 @@ export const accessControlService = {
     const role = user.role;
     const allowedPages = ROLE_PAGE_PERMISSIONS[role] || [];
 
+    // Strip basePath if present (e.g. /project-management/dashboard -> /dashboard)
+    const strippedPath = pathname.replace(/^\/project-management/, '') || '/';
+
     // Normalize path (e.g. /projects/PROJ-0001 -> /projects/[id])
-    let normalizedPath = pathname;
+    let normalizedPath = strippedPath;
     if (
-      pathname.startsWith('/projects/') &&
-      pathname !== '/projects' &&
-      pathname !== '/projects/charter' &&
-      pathname !== '/projects/timing-status' &&
-      pathname !== '/projects/team' &&
-      pathname !== '/projects/detail'
+      strippedPath.startsWith('/projects/') &&
+      strippedPath !== '/projects' &&
+      strippedPath !== '/projects/charter' &&
+      strippedPath !== '/projects/timing-status' &&
+      strippedPath !== '/projects/team' &&
+      strippedPath !== '/projects/detail'
     ) {
       normalizedPath = '/projects/[id]';
     }
 
-    const isAllowed = allowedPages.some((p) => p === pathname || p === normalizedPath);
+    const isAllowed = allowedPages.some((p) => p === pathname || p === strippedPath || p === normalizedPath);
 
     if (!isAllowed) {
       return {
