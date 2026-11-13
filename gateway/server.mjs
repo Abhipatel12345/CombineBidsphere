@@ -73,13 +73,17 @@ function proxyHttpRequest(targetUrl, req, res) {
       headers,
     },
     (proxyRes) => {
-      res.writeHead(proxyRes.statusCode || 200, proxyRes.headers);
+      proxyRes.on("error", () => {
+        // Handle socket disconnects gracefully
+      });
+      if (!res.headersSent) {
+        res.writeHead(proxyRes.statusCode || 200, proxyRes.headers);
+      }
       proxyRes.pipe(res, { end: true });
     }
   );
 
   proxyReq.on("error", (err) => {
-    console.error(`[Gateway Proxy Error] ${req.method} ${req.url} → ${targetUrl}:`, err.message);
     if (!res.headersSent) {
       res.writeHead(502, { "Content-Type": "application/json" });
       res.end(
@@ -89,6 +93,14 @@ function proxyHttpRequest(targetUrl, req, res) {
         })
       );
     }
+  });
+
+  req.on("error", () => {
+    proxyReq.destroy();
+  });
+
+  res.on("error", () => {
+    proxyReq.destroy();
   });
 
   req.pipe(proxyReq, { end: true });
@@ -503,6 +515,14 @@ server.on("upgrade", (req, socket, head) => {
   });
 
   proxyReq.end();
+});
+
+server.on("clientError", (err, socket) => {
+  if (err.code === "ECONNRESET" || !socket.writable) {
+    socket.destroy();
+    return;
+  }
+  socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
 });
 
 export { server };

@@ -17,6 +17,7 @@ console.log(`
 `);
 
 const children = [];
+let isShuttingDown = false;
 
 function runProcess(name, command, args, cwd) {
   const isWindows = process.platform === "win32";
@@ -45,6 +46,14 @@ function runProcess(name, command, args, cwd) {
 
   child.on("exit", (code, signal) => {
     console.log(`[${name}] exited with code ${code || signal}`);
+    if (code !== 0 && !isShuttingDown) {
+      console.log(`[${name}] Restarting in 1.5s...`);
+      setTimeout(() => {
+        if (!isShuttingDown) {
+          runProcess(name, command, args, cwd);
+        }
+      }, 1500);
+    }
   });
 
   children.push(child);
@@ -61,6 +70,7 @@ const bidsphere = runProcess("BidSphere", "npm", ["--prefix", "apps/bidsphere", 
 const gateway = runProcess("Gateway", "node", ["gateway/server.mjs"]);
 
 function cleanup() {
+  isShuttingDown = true;
   console.log("\nShutting down all development services...");
   for (const child of children) {
     try {
