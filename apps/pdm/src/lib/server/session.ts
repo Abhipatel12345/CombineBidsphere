@@ -6,7 +6,7 @@ const SESSION_SECRET =
   process.env.SESSION_SECRET ||
   process.env.PDM_ERP_API_SECRET ||
   process.env.ERP_API_SECRET ||
-  'pdm-enterprise-secure-session-salt-2026';
+  'bidsphere-pdm-enterprise-unified-session-secret-2026';
 
 const API_KEY =
   process.env.PDM_ERP_API_KEY ||
@@ -125,10 +125,19 @@ export function getSessionFromRequest(
   req: NextRequest,
   _allowFallback = false
 ): PDMUserSession | null {
-  // 1. Inspect pdm_session cookie
-  const cookieVal = req.cookies.get('pdm_session')?.value;
+  // 1. Inspect pdm_session or procurement_session cookie
+  const cookieVal =
+    req.cookies.get('pdm_session')?.value ||
+    req.cookies.get('procurement_session')?.value;
   if (cookieVal) {
-    const verified = verifySession(cookieVal);
+    const rawToken = cookieVal.replace(/^["']|["']$/g, '');
+    let decodedToken = rawToken;
+    try {
+      decodedToken = decodeURIComponent(rawToken);
+    } catch {
+      // keep raw
+    }
+    const verified = verifySession(decodedToken) || verifySession(rawToken);
     if (verified) {
       return verified;
     }

@@ -117,9 +117,10 @@ const server = http.createServer(async (req, res) => {
 
   // Parse active sessions
   const bidsphereSession = verifySession(cookies.bidsphere_session);
-  const pdmSession = verifySession(cookies.pdm_session);
+  const pdmSession = verifySession(cookies.pdm_session) || verifySession(cookies.procurement_session);
   const isBidsphereAuthed = !!bidsphereSession;
   const isPdmAuthed = !!pdmSession;
+  const isProcurementAuthed = !!pdmSession;
 
   // Intercept any direct legacy login paths and redirect to root unified login
   if (
@@ -184,10 +185,20 @@ const server = http.createServer(async (req, res) => {
         );
       }
 
-      if (authResult.pdmSessionToken) {
+      if (authResult.pdmSessionToken || authResult.procurementSessionToken) {
+        const pToken = authResult.pdmSessionToken || authResult.procurementSessionToken;
         cookieList.push(
-          serializeCookie("pdm_session", authResult.pdmSessionToken, {
+          serializeCookie("pdm_session", pToken, {
             maxAge,
+            path: "/",
+            httpOnly: true,
+            sameSite: "Lax",
+          })
+        );
+        cookieList.push(
+          serializeCookie("procurement_session", pToken, {
+            maxAge,
+            path: "/",
             httpOnly: true,
             sameSite: "Lax",
           })
@@ -198,6 +209,7 @@ const server = http.createServer(async (req, res) => {
         cookieList.push(
           serializeCookie("unified_app_choice", authResult.multiAppToken, {
             maxAge,
+            path: "/",
             httpOnly: true,
             sameSite: "Lax",
           })
@@ -218,8 +230,8 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // GET /api/unified-auth/session
-  if (pathname === "/api/unified-auth/session") {
+  // GET /api/unified-auth/session or /api/auth/session
+  if (pathname === "/api/unified-auth/session" || pathname === "/api/auth/session") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(
       JSON.stringify({
@@ -232,12 +244,24 @@ const server = http.createServer(async (req, res) => {
           authenticated: isPdmAuthed,
           user: pdmSession?.user || null,
         },
+        procurement: {
+          authenticated: isPdmAuthed,
+          user: pdmSession?.user || null,
+        },
       })
     );
     return;
   }
 
-
+  // Proxy direct PDM / Procurement auth checks to Next.js
+  if (
+    pathname.startsWith("/api/auth/pdm-") ||
+    pathname.startsWith("/api/auth/procurement-")
+  ) {
+    req.url = `/project-management${req.url}`;
+    proxyHttpRequest(`http://127.0.0.1:${config.pdmPort}`, req, res);
+    return;
+  }
 
   // POST /api/unified-auth/logout or GET /logout
   if (
@@ -247,10 +271,11 @@ const server = http.createServer(async (req, res) => {
     pathname === "/project-management/logout"
   ) {
     const expiredCookies = [
-      serializeCookie("bidsphere_session", "", { maxAge: 0 }),
-      serializeCookie("pdm_session", "", { maxAge: 0 }),
-      serializeCookie("unified_app_choice", "", { maxAge: 0 }),
-      serializeCookie("inteva-auth-remember", "", { maxAge: 0 }),
+      serializeCookie("bidsphere_session", "", { maxAge: 0, path: "/" }),
+      serializeCookie("pdm_session", "", { maxAge: 0, path: "/" }),
+      serializeCookie("procurement_session", "", { maxAge: 0, path: "/" }),
+      serializeCookie("unified_app_choice", "", { maxAge: 0, path: "/" }),
+      serializeCookie("inteva-auth-remember", "", { maxAge: 0, path: "/" }),
     ];
 
     if (req.method === "POST" && pathname.startsWith("/api/")) {
@@ -358,7 +383,7 @@ const server = http.createServer(async (req, res) => {
       pathname.includes("/favicon.") ||
       pathname.startsWith("/project-management/api/auth/");
 
-    // Check authorization for protected PDM pages/endpoints
+    // Check authorization for protected PDM / Procurement pages/endpoints
     if (!isPublicStatic && !isPdmAuthed) {
       const isHtmlRequest = (req.headers.accept || "").includes("text/html");
       if (isHtmlRequest) {
@@ -378,8 +403,8 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(401, { "Content-Type": "application/json" });
       res.end(
         JSON.stringify({
-          error: "Unauthorized: Active Project Management session required.",
-          code: "UNAUTHORIZED_PDM",
+          error: "Unauthorized: Active Procurement / Project Management session required.",
+          code: "UNAUTHORIZED_PROCUREMENT",
         })
       );
       return;

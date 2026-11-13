@@ -23,23 +23,53 @@ interface AuthContextType {
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
-  const [user, setUser] = useState<UserDetails | null>(null);
-  const [isLoading, setIsLoading] = useState(true);
+  const [user, setUser] = useState<UserDetails | null>(() => {
+    if (typeof window !== 'undefined') {
+      try {
+        const stored =
+          localStorage.getItem('pdm_user_session') ||
+          localStorage.getItem('procurement_user_session') ||
+          sessionStorage.getItem('pdm_user_session') ||
+          sessionStorage.getItem('procurement_user_session');
+        if (stored) return JSON.parse(stored);
+      } catch {
+        // ignore
+      }
+    }
+    return null;
+  });
+  const [isLoading, setIsLoading] = useState(() => {
+    if (typeof window !== 'undefined') {
+      const stored =
+        localStorage.getItem('pdm_user_session') ||
+        localStorage.getItem('procurement_user_session') ||
+        sessionStorage.getItem('pdm_user_session') ||
+        sessionStorage.getItem('procurement_user_session');
+      return !stored;
+    }
+    return true;
+  });
   const router = useRouter();
   const queryClient = useQueryClient();
 
   const checkSession = useCallback(async () => {
     try {
-      setIsLoading(true);
       const userDetails = await authService.getLoggedUser();
       setUser(userDetails);
       if (typeof window !== 'undefined') {
         localStorage.setItem('pdm_user_session', JSON.stringify(userDetails));
+        localStorage.setItem('procurement_user_session', JSON.stringify(userDetails));
       }
     } catch {
-      setUser(null);
       if (typeof window !== 'undefined') {
-        localStorage.removeItem('pdm_user_session');
+        const stored =
+          localStorage.getItem('pdm_user_session') ||
+          localStorage.getItem('procurement_user_session');
+        if (!stored) {
+          setUser(null);
+        }
+      } else {
+        setUser(null);
       }
     } finally {
       setIsLoading(false);
@@ -87,7 +117,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       queryClient.clear();
       if (typeof window !== 'undefined') {
         localStorage.removeItem('pdm_user_session');
+        localStorage.removeItem('procurement_user_session');
+        sessionStorage.removeItem('pdm_user_session');
+        sessionStorage.removeItem('procurement_user_session');
         localStorage.removeItem('pdm_session');
+        localStorage.removeItem('procurement_session');
         window.location.replace('/login?logout=success');
       }
     }

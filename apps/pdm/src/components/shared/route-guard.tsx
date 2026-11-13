@@ -23,7 +23,14 @@ export function RouteGuard({ children }: RouteGuardProps) {
   useEffect(() => {
     if (!isLoading && !isAuthenticated && !isPublicPath) {
       if (typeof window !== 'undefined') {
-        window.location.replace(`/login?redirect=${encodeURIComponent(pathname)}&app=pdm`);
+        const cached =
+          localStorage.getItem('pdm_user_session') ||
+          localStorage.getItem('procurement_user_session') ||
+          sessionStorage.getItem('pdm_user_session') ||
+          sessionStorage.getItem('procurement_user_session');
+        if (!cached) {
+          window.location.replace(`/login?redirect=${encodeURIComponent(pathname)}&app=procurement`);
+        }
       }
     }
   }, [isLoading, isAuthenticated, isPublicPath, pathname]);

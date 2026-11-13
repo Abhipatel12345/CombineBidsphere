@@ -331,24 +331,15 @@ axiosClient.interceptors.response.use(
       };
     }
 
-    // Auto-redirect on 401 if in browser environment and on session auth check
+    // Handle 401 gracefully without forcing abrupt browser redirect loops during session validation
     if (status === 401 && typeof window !== 'undefined' && !window.location.pathname.startsWith('/login')) {
       const requestUrl = error.config?.url || '';
-      // NEVER auto-redirect or treat login attempts as session expirations
-      if (!requestUrl.includes('/api/auth/pdm-login')) {
-        const isAuthCheck =
-          requestUrl.includes('/api/auth/pdm-session') ||
-          requestUrl.includes('frappe.auth.get_logged_user');
-        if (isAuthCheck) {
-          const hadActiveSession = !!localStorage.getItem('pdm_user_session');
-          if (hadActiveSession) {
-            localStorage.removeItem('pdm_user_session');
-            window.location.href = '/login?session_expired=true';
-          } else {
-            // Visitor was simply unauthenticated; do not falsely claim session expired
-            window.location.href = '/login';
-          }
-        }
+      if (
+        !requestUrl.includes('/api/auth/pdm-login') &&
+        !requestUrl.includes('/api/auth/pdm-session') &&
+        !requestUrl.includes('/api/auth/procurement-session')
+      ) {
+        console.warn('[API Auth Expiration Notice] 401 received on protected endpoint:', requestUrl);
       }
     }
 

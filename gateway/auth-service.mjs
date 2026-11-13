@@ -419,6 +419,54 @@ async function authenticatePdm(usr, pwd) {
       lower === "admin@example.com"
     ) {
       loginId = "Administrator";
+    } else {
+      // Look up user in PDM ERPNext by email or username to resolve canonical User record
+      try {
+        let foundName = null;
+        if (usr.includes("@")) {
+          const filterStr = JSON.stringify([["email", "=", usr.trim()]]);
+          const searchRes = await fetch(
+            `${erpUrl}/api/resource/User?filters=${encodeURIComponent(filterStr)}&fields=${encodeURIComponent(JSON.stringify(["name"]))}`,
+            {
+              headers: {
+                Authorization: `token ${apiKey}:${apiSecret}`,
+                Accept: "application/json",
+              },
+              signal: AbortSignal.timeout(4000),
+            }
+          );
+          if (searchRes.ok) {
+            const sJson = await searchRes.json();
+            if (sJson.data && sJson.data.length > 0 && sJson.data[0].name) {
+              foundName = sJson.data[0].name;
+            }
+          }
+        }
+        if (!foundName) {
+          const filterStr = JSON.stringify([["username", "=", usr.trim()]]);
+          const searchRes = await fetch(
+            `${erpUrl}/api/resource/User?filters=${encodeURIComponent(filterStr)}&fields=${encodeURIComponent(JSON.stringify(["name"]))}`,
+            {
+              headers: {
+                Authorization: `token ${apiKey}:${apiSecret}`,
+                Accept: "application/json",
+              },
+              signal: AbortSignal.timeout(4000),
+            }
+          );
+          if (searchRes.ok) {
+            const sJson = await searchRes.json();
+            if (sJson.data && sJson.data.length > 0 && sJson.data[0].name) {
+              foundName = sJson.data[0].name;
+            }
+          }
+        }
+        if (foundName) {
+          loginId = foundName;
+        }
+      } catch {
+        // non-blocking
+      }
     }
 
     let res = await fetch(`${erpUrl}/api/method/login`, {
@@ -546,9 +594,10 @@ export async function authenticateUnified(username, password, rememberMe = false
           fullName: bidsphereRes.user.full_name || pdmRes.user.fullName,
           email: bidsphereRes.user.email || pdmRes.user.email,
         },
-        apps: ["bidsphere", "pdm"],
+        apps: ["bidsphere", "procurement", "pdm"],
         bidsphereUser: bidsphereRes.user,
         pdmUser: pdmRes.user,
+        procurementUser: pdmRes.user,
       },
       ttl
     );
@@ -560,12 +609,14 @@ export async function authenticateUnified(username, password, rememberMe = false
       success: true,
       targetApp: "both",
       redirectUrl: "/select-application",
-      availableApps: ["bidsphere", "pdm"],
+      availableApps: ["bidsphere", "procurement", "pdm"],
       multiAppToken,
       bidsphereSessionToken,
       pdmSessionToken,
+      procurementSessionToken: pdmSessionToken,
       bidsphereUser: bidsphereRes.user,
       pdmUser: pdmRes.user,
+      procurementUser: pdmRes.user,
       message: "Authenticated successfully with both platforms.",
     };
   }
@@ -576,6 +627,7 @@ export async function authenticateUnified(username, password, rememberMe = false
     return {
       success: true,
       targetApp: "bidsphere",
+      app: "bidsphere",
       redirectUrl: "/bidsphere/dashboard",
       availableApps: ["bidsphere"],
       bidsphereSessionToken,
@@ -584,16 +636,20 @@ export async function authenticateUnified(username, password, rememberMe = false
     };
   }
 
-  // Scenario 2: Project Management (PDM) User only
+  // Scenario 2: Project Management / Procurement User only
   if (!bidsphereOk && pdmOk) {
     const pdmSessionToken = signSession({ user: pdmRes.user }, ttl);
     return {
       success: true,
-      targetApp: "pdm",
+      targetApp: "procurement",
+      app: "procurement",
       redirectUrl: "/project-management/dashboard",
-      availableApps: ["pdm"],
+      availableApps: ["procurement", "pdm"],
       pdmSessionToken,
+      procurementSessionToken: pdmSessionToken,
       pdmUser: pdmRes.user,
+      procurementUser: pdmRes.user,
+      user: pdmRes.user,
       message: "Authenticated with Project Management ERPNext successfully.",
     };
   }
