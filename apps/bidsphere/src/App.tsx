@@ -32,7 +32,6 @@ import RFQListPage from "./pages/sourcing/RFQListPage";
 
 // Lazy — every other route is code-split into its own chunk so the initial
 // bundle no longer ships the entire app (3D login hero, charts, PDF, etc.).
-const LoginPage = lazy(() => import("./pages/auth/LoginPage"));
 const OtpVerificationPage = lazy(
   () => import("./pages/auth/OtpVerificationPage")
 );

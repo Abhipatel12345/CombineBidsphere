@@ -111,21 +111,19 @@ export function renderLoginHtml(options = {}) {
         </div>
 
         <!-- Alert Notification Box -->
-        <div id="alertBox" class="${alertMessage ? '' : 'hidden'} mb-5 p-3.5 rounded-xl text-sm border flex items-start gap-3 ${
-          alertType === 'error'
-            ? 'bg-rose-500/10 border-rose-500/30 text-rose-300'
-            : alertType === 'success'
-            ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
-            : 'bg-blue-500/10 border-blue-500/30 text-blue-300'
-        }">
+        <div id="alertBox" class="${alertMessage ? '' : 'hidden'} mb-5 p-3.5 rounded-xl text-sm border flex items-start gap-3 ${alertType === 'error'
+      ? 'bg-rose-500/10 border-rose-500/30 text-rose-300'
+      : alertType === 'success'
+        ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
+        : 'bg-blue-500/10 border-blue-500/30 text-blue-300'
+    }">
           <svg class="w-5 h-5 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-            ${
-              alertType === 'error'
-                ? '<path stroke-linecap="round" stroke-linejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>'
-                : alertType === 'success'
-                ? '<path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/>'
-                : '<path stroke-linecap="round" stroke-linejoin="round" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>'
-            }
+            ${alertType === 'error'
+      ? '<path stroke-linecap="round" stroke-linejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>'
+      : alertType === 'success'
+        ? '<path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/>'
+        : '<path stroke-linecap="round" stroke-linejoin="round" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>'
+    }
           </svg>
           <span id="alertMessage" class="flex-1">${alertMessage}</span>
         </div>

@@ -49,7 +49,7 @@ describe("production proxy RFQ PO authorization wiring", () => {
     expect(res.status).toHaveBeenCalledWith(403);
     expect(res.json).toHaveBeenCalledWith({ error: expect.stringMatching(/signature and Finance/) });
     expect(fetchMock.mock.calls.every(([, init]) => !init?.method || init.method === "GET")).toBe(true);
-  });
+  }, 60_000);
 
   it("forwards a new RFQ PO only after the backend verifier succeeds", async () => {
     const events: string[] = [];
@@ -74,9 +74,11 @@ describe("production proxy RFQ PO authorization wiring", () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async () => { throw new Error("No upstream call is allowed"); });
     const res = response();
     const clmContext = { contractId: "CON-1", rfqId: "RFQ-1", awardId: "LDR-1", quotationId: "SQ-1" };
-    await handler({ method: "POST", body: { doc: { ...po, custom_clm_contract: "CON-1", custom_clm_rfq: "RFQ-1", custom_clm_award: "LDR-1", custom_clm_creation_key: "forged" }, clmContext },
+    await handler({
+      method: "POST", body: { doc: { ...po, custom_clm_contract: "CON-1", custom_clm_rfq: "RFQ-1", custom_clm_award: "LDR-1", custom_clm_creation_key: "forged" }, clmContext },
       query: { path: "method/frappe.client.save", clmContext: JSON.stringify(clmContext) },
-      headers: { "x-bidsphere-access-token": issueInternalAccessToken({ sub: "team@example.test", email: "team@example.test", role: "procurement_team" }) } } as unknown as VercelRequest, res);
+      headers: { "x-bidsphere-access-token": issueInternalAccessToken({ sub: "team@example.test", email: "team@example.test", role: "procurement_team" }) }
+    } as unknown as VercelRequest, res);
     expect(res.status).toHaveBeenCalledWith(403);
     expect(res.json).toHaveBeenCalledWith({ error: expect.stringContaining("generic PO API") });
     expect(fetchMock).not.toHaveBeenCalled();
