@@ -14,7 +14,7 @@
     "dev:pdm": "npm run dev --workspace=apps/pdm -- -p 3001",
     "build:bidsphere": "npm run build --workspace=apps/bidsphere",
     "build:pdm": "npm run build --workspace=apps/pdm",
-    "build": "npm run build --workspaces --if-present",
+    "build": "npm run build --workspaces --if-present && node scripts/copy-next-output.mjs",
     "test:bidsphere": "npm run test --workspace=apps/bidsphere",
     "test:pdm": "npm run test --workspace=apps/pdm",
     "test:gateway": "node --test gateway/tests/unified-auth.test.mjs gateway/tests/gateway-server.test.mjs",

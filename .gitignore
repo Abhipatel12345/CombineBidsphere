@@ -12,6 +12,7 @@ node_modules/
 dist/
 dist-ssr/
 .next/
+/public/
 out/
 build/
 *.local
