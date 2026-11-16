@@ -216,6 +216,16 @@ const server = http.createServer(async (req, res) => {
         );
       }
 
+      // Clear opposing session cookies to prevent cross-application redirect collisions
+      if (authResult.targetApp === "bidsphere") {
+        cookieList.push(serializeCookie("pdm_session", "", { maxAge: 0, path: "/" }));
+        cookieList.push(serializeCookie("procurement_session", "", { maxAge: 0, path: "/" }));
+        cookieList.push(serializeCookie("unified_app_choice", "", { maxAge: 0, path: "/" }));
+      } else if (authResult.targetApp === "pdm" || authResult.targetApp === "procurement") {
+        cookieList.push(serializeCookie("bidsphere_session", "", { maxAge: 0, path: "/" }));
+        cookieList.push(serializeCookie("unified_app_choice", "", { maxAge: 0, path: "/" }));
+      }
+
       res.writeHead(200, {
         "Content-Type": "application/json",
         "Set-Cookie": cookieList,

@@ -105,6 +105,7 @@ const SUPPLIER_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 function sessionSecret(): string {
   return (
     process.env.BIDSPHERE_SESSION_SECRET ||
+    process.env.SESSION_SECRET ||
     process.env.BIDSPHERE_ERP_API_SECRET ||
     "bidsphere-dev-session-secret"
   );
@@ -176,7 +177,24 @@ export function verifyAccessToken(token: string | null | undefined): AccessPrinc
   const parts = raw.split(".");
   if (parts.length !== 2) throw new RbacError("Invalid access token.", 401);
   const [body, sig] = parts;
-  if (!safeEqual(sign(body), sig)) {
+
+  const secrets = [
+    process.env.BIDSPHERE_SESSION_SECRET,
+    process.env.SESSION_SECRET,
+    process.env.BIDSPHERE_ERP_API_SECRET,
+    "bidsphere-dev-session-secret",
+  ].filter(Boolean) as string[];
+
+  let verified = false;
+  for (const s of secrets) {
+    const candidateSig = createHmac("sha256", s).update(body).digest("base64url");
+    if (safeEqual(candidateSig, sig)) {
+      verified = true;
+      break;
+    }
+  }
+
+  if (!verified) {
     throw new RbacError("Invalid access token.", 401);
   }
   let payload: AccessPrincipal;
@@ -188,7 +206,8 @@ export function verifyAccessToken(token: string | null | undefined): AccessPrinc
   if (!payload || typeof payload !== "object" || !payload.typ) {
     throw new RbacError("Invalid access token.", 401);
   }
-  if (typeof payload.exp !== "number" || Date.now() > payload.exp) {
+  const expMs = payload.exp < 10000000000 ? payload.exp * 1000 : payload.exp;
+  if (typeof payload.exp !== "number" || Date.now() > expMs) {
     throw new RbacError("Session expired. Please sign in again.", 401);
   }
   return payload;

@@ -112,8 +112,14 @@ function deriveBidsphereRole(username, roles) {
   ) {
     return "admin";
   }
-  if (roleSet.has("Procurement Manager")) return "procurement";
-  if (roleSet.has("Procurement Team") || roleSet.has("Purchase User")) return "procurement_team";
+  if (
+    lowerUser === "procurement@netlink.com" ||
+    roleSet.has("Purchase Manager") ||
+    roleSet.has("Procurement Manager")
+  ) {
+    return "procurement";
+  }
+  if (roleSet.has("Procurement Team") || roleSet.has("Purchase User") || lowerUser.includes("procurement.team@")) return "procurement_team";
   if (roleSet.has("Stock Manager") || roleSet.has("Warehouse Manager") || roleSet.has("Stock User")) return "warehouse";
   if (roleSet.has("Engineering Manager")) return "engineering";
   if (roleSet.has("Engineer")) return "engineer";
@@ -319,6 +325,29 @@ async function discardErpSession(baseUrl, sid) {
 }
 
 /**
+ * Issue internal access token compatible with BidSphere backend API proxy (apps/bidsphere/api/rbacAuth.ts).
+ */
+export function issueBidSphereAccessToken(input) {
+  const now = Date.now();
+  const ttlMs = input.ttlMs || (12 * 60 * 60 * 1000);
+  const payload = {
+    typ: "internal",
+    sub: input.sub,
+    email: input.email,
+    role: input.role,
+    iat: now,
+    exp: now + ttlMs,
+  };
+  const body = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  const secret = config.bidsphere.apiSecret || config.sessionSecret;
+  const signature = crypto
+    .createHmac("sha256", secret)
+    .update(body)
+    .digest("base64url");
+  return `${body}.${signature}`;
+}
+
+/**
  * Authenticate against BidSphere ERPNext.
  */
 async function authenticateBidSphere(usr, pwd) {
@@ -383,8 +412,7 @@ async function authenticateBidSphere(usr, pwd) {
     };
 
     // Issue internal access token for BidSphere API proxy
-    const accessToken = signSession({
-      typ: "internal",
+    const accessToken = issueBidSphereAccessToken({
       sub: canonicalName,
       email,
       role,

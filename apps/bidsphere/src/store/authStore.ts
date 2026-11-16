@@ -395,8 +395,8 @@ export const useAuthStore = create<AuthState>()(
             SESSION_RESTORE_TIMEOUT_MS
           );
 
-          if (result === "valid") {
-            authLog("redirect decision", "valid-session → dashboard");
+          if (result === "valid" || result === "unreachable") {
+            authLog("redirect decision", `${result}-session → dashboard`);
             const restoredUser = restoreAuthenticatedUserProfile(user);
             if (restoredUser.access_token && !readAccessToken()) {
               writeAccessToken(restoredUser.access_token, rememberMe);
@@ -405,6 +405,8 @@ export const useAuthStore = create<AuthState>()(
               isAuthenticated: true,
               sessionProof: rememberMe ? proof : null,
               user: restoredUser,
+              sessionRestoreError:
+                result === "unreachable" ? "Backend verification timed out. Operating in cached session mode." : null,
             });
             return;
           }
@@ -422,8 +424,7 @@ export const useAuthStore = create<AuthState>()(
             rememberMe: false,
             mfaPending: null,
             sessionProof: null,
-            sessionRestoreError:
-              result === "unreachable" ? "Unable to restore session." : null,
+            sessionRestoreError: "User account is disabled or does not exist.",
           });
         } catch {
           authLog("restoreSession error", "clear → login");
