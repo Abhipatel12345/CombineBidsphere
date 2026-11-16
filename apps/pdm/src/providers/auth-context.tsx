@@ -23,34 +23,26 @@ interface AuthContextType {
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
-  const [user, setUser] = useState<UserDetails | null>(() => {
-    if (typeof window !== 'undefined') {
-      try {
-        const stored =
-          localStorage.getItem('pdm_user_session') ||
-          localStorage.getItem('procurement_user_session') ||
-          sessionStorage.getItem('pdm_user_session') ||
-          sessionStorage.getItem('procurement_user_session');
-        if (stored) return JSON.parse(stored);
-      } catch {
-        // ignore
-      }
-    }
-    return null;
-  });
-  const [isLoading, setIsLoading] = useState(() => {
-    if (typeof window !== 'undefined') {
+  const [user, setUser] = useState<UserDetails | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const router = useRouter();
+  const queryClient = useQueryClient();
+
+  useEffect(() => {
+    try {
       const stored =
         localStorage.getItem('pdm_user_session') ||
         localStorage.getItem('procurement_user_session') ||
         sessionStorage.getItem('pdm_user_session') ||
         sessionStorage.getItem('procurement_user_session');
-      return !stored;
+      if (stored) {
+        setUser(JSON.parse(stored));
+        setIsLoading(false);
+      }
+    } catch {
+      // ignore
     }
-    return true;
-  });
-  const router = useRouter();
-  const queryClient = useQueryClient();
+  }, []);
 
   const checkSession = useCallback(async () => {
     try {

@@ -23,6 +23,7 @@ export function NetlinkLogo({
           height={36}
           className="h-8 w-auto object-contain"
           priority
+          unoptimized
         />
       </div>
     );
@@ -39,6 +40,7 @@ export function NetlinkLogo({
             height={44}
             className="h-full w-auto object-contain"
             priority
+            unoptimized
           />
         </div>
         <div>
@@ -64,6 +66,7 @@ export function NetlinkLogo({
             height={36}
             className="h-full w-auto object-contain"
             priority
+            unoptimized
           />
         </div>
         <div>
@@ -89,6 +92,7 @@ export function NetlinkLogo({
           height={36}
           className="h-full w-auto object-contain"
           priority
+          unoptimized
         />
       </div>
       <div className="flex flex-col">

@@ -391,7 +391,9 @@ const server = http.createServer(async (req, res) => {
     const isPublicStatic =
       pathname.startsWith("/project-management/_next/") ||
       pathname.includes("/favicon.") ||
-      pathname.startsWith("/project-management/api/auth/");
+      pathname.startsWith("/project-management/api/auth/") ||
+      pathname.startsWith("/project-management/images/") ||
+      /\.(png|jpe?g|gif|svg|ico|webp|woff2?|ttf|eot|css|js|map)$/i.test(pathname);
 
     // Check authorization for protected PDM / Procurement pages/endpoints
     if (!isPublicStatic && !isPdmAuthed) {
@@ -491,9 +493,22 @@ const server = http.createServer(async (req, res) => {
 
 
 
+  // Next.js Turbopack / HMR / Chunks & Image optimization
+  if (pathname.startsWith("/_next/")) {
+    proxyHttpRequest(`http://127.0.0.1:${config.pdmPort}`, req, res);
+    return;
+  }
+
   // Static files or root fallback
-  if (pathname.startsWith("/assets/") || pathname.endsWith(".js") || pathname.endsWith(".css")) {
-    proxyHttpRequest(`http://127.0.0.1:${config.bidspherePort}`, req, res);
+  if (
+    pathname.startsWith("/assets/") ||
+    pathname.startsWith("/images/") ||
+    /\.(png|jpe?g|gif|svg|ico|webp|woff2?|ttf|eot|css|js|map)$/i.test(pathname)
+  ) {
+    const referer = req.headers.referer || "";
+    const isPdmClient = referer.includes("/project-management");
+    const targetPort = isPdmClient ? config.pdmPort : config.bidspherePort;
+    proxyHttpRequest(`http://127.0.0.1:${targetPort}`, req, res);
     return;
   }
 

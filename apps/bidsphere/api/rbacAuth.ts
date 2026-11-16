@@ -27,21 +27,21 @@ export type AppRole =
 
 export type AccessPrincipal =
   | {
-      typ: "internal";
-      sub: string;
-      email: string;
-      role: AppRole;
-      exp: number;
-      iat: number;
-    }
+    typ: "internal";
+    sub: string;
+    email: string;
+    role: AppRole;
+    exp: number;
+    iat: number;
+  }
   | {
-      typ: "supplier";
-      sub: string;
-      supplier: string;
-      onboarding?: string;
-      exp: number;
-      iat: number;
-    };
+    typ: "supplier";
+    sub: string;
+    supplier: string;
+    onboarding?: string;
+    exp: number;
+    iat: number;
+  };
 
 export class RbacError extends Error {
   status: number;
@@ -593,10 +593,10 @@ export function enforceEcrMutationRbac(
       throw new RbacError("Only an administrator can delete an ECR.", 403);
     }
     requireRoles(principal, ["engineer", "procurement_team", "procurement"]);
-      const businessCaseAttachmentUpdate = currentDocument?.ecr_workflow_version === "extended_v1" &&
-        currentStatus === "Technical Approved" &&
-        Object.keys(payload).every((field) => ["supporting_documents", "access_token"].includes(field));
-      if (principal.role === "engineer" && !businessCaseAttachmentUpdate && !["Draft", "Sent Back", "Needs Revision"].includes(currentStatus || "")) {
+    const businessCaseAttachmentUpdate = currentDocument?.ecr_workflow_version === "extended_v1" &&
+      currentStatus === "Technical Approved" &&
+      Object.keys(payload).every((field) => ["supporting_documents", "access_token"].includes(field));
+    if (principal.role === "engineer" && !businessCaseAttachmentUpdate && !["Draft", "Sent Back", "Needs Revision"].includes(currentStatus || "")) {
       throw new RbacError("Engineers can edit only Draft or Sent Back ECRs.", 403);
     }
     if (principal.role === "engineer") {

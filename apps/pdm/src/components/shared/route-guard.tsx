@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useEffect } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useRouter, usePathname } from 'next/navigation';
 import { useAuth } from '@/providers/auth-context';
 import { accessControlService } from '@/services/access-control.service';
@@ -17,11 +17,16 @@ export function RouteGuard({ children }: RouteGuardProps) {
   const { user, isAuthenticated, isLoading } = useAuth();
   const router = useRouter();
   const pathname = usePathname();
+  const [mounted, setMounted] = useState(false);
+
+  useEffect(() => {
+    setMounted(true);
+  }, []);
 
   const isPublicPath = PUBLIC_PATHS.some((path) => pathname === path || pathname.startsWith(path + '/'));
 
   useEffect(() => {
-    if (!isLoading && !isAuthenticated && !isPublicPath) {
+    if (mounted && !isLoading && !isAuthenticated && !isPublicPath) {
       if (typeof window !== 'undefined') {
         const cached =
           localStorage.getItem('pdm_user_session') ||
@@ -33,9 +38,9 @@ export function RouteGuard({ children }: RouteGuardProps) {
         }
       }
     }
-  }, [isLoading, isAuthenticated, isPublicPath, pathname]);
+  }, [mounted, isLoading, isAuthenticated, isPublicPath, pathname]);
 
-  if (isLoading && !isPublicPath) {
+  if (!mounted || (isLoading && !isPublicPath)) {
     return (
       <div className="min-h-screen bg-[#F7F9FC] flex flex-col items-center justify-center space-y-4 font-sans text-slate-800">
         <div className="h-12 w-12 rounded-2xl bg-sky-50 border border-sky-200 text-sky-600 flex items-center justify-center shadow-xs">
