@@ -158,3 +158,26 @@ npm run build
 # Start production unified server
 npm run start
 ```
+
+---
+
+## 8. Vercel Deployment Guide
+
+### Deploying Project Management (PDM — Next.js)
+1. In the Vercel Dashboard, click **Add New...** → **Project** and import `CombineBidsphere`.
+2. When prompted for **Root Directory**, set it to:
+   ```text
+   apps/pdm
+   ```
+3. Add the required environment variables from [`apps/pdm/.env.example`](apps/pdm/.env.example).
+4. Click **Deploy**.
+
+### Deploying BidSphere (Procure-to-Pay — Vite)
+1. In the Vercel Dashboard, import the same `CombineBidsphere` repository again.
+2. Set the **Root Directory** to:
+   ```text
+   apps/bidsphere
+   ```
+3. Add the required environment variables from [`apps/bidsphere/.env.example`](apps/bidsphere/.env.example).
+4. Click **Deploy**.
+
